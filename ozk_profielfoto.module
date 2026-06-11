@@ -1,0 +1,172 @@
+<?php
+
+/**
+ * Implements hook_entity_insert().
+ * Vervangt de Rule: "Entityform Profielfoto Upload"
+ */
+function ozk_profielfoto_entity_insert($entity, $type) {
+	if ($type === 'entityform' && $entity->type === 'profielfoto') {
+		_ozk_profielfoto_sync_profielfoto_naar_civicrm($entity);
+	}
+}
+
+/**
+ * Implements hook_entity_update().
+ * Vervangt de Rule: "Entityform Profielfoto Update"
+ */
+function ozk_profielfoto_entity_update($entity, $type) {
+	if ($type === 'entityform' && $entity->type === 'profielfoto') {
+		_ozk_profielfoto_sync_profielfoto_naar_civicrm($entity);
+	}
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function ozk_profielfoto_form_alter(&$form, &$form_state, $form_id) {
+    if ($form_id === 'profielfoto_entityform_edit_form' || $form_id === 'entityform_edit_form') {
+        $bundle = isset($form['#bundle']) ? $form['#bundle'] : '';
+        if ($bundle === 'profielfoto' || $form_id === 'profielfoto_entityform_edit_form') {
+            
+            // DEBUG: Bevestig dat de alter is geladen
+            watchdog('ozk_profielfoto', "Form alter actief voor: @id", ['@id' => $form_id], WATCHDOG_DEBUG);
+            
+            $form['actions']['submit']['#submit'][] = '_ozk_profielfoto_profielfoto_redirect_force';
+        }
+    }
+}
+
+/**
+ * Geforceerde redirect handler.
+ */
+function _ozk_profielfoto_profielfoto_redirect_force($form, &$form_state) {
+    if (isset($_GET['destination'])) {
+        // DEBUG: Log als er een destination wordt gedwarsboomd
+        watchdog('ozk_profielfoto', "Destination '@dest' verwijderd voor redirect.", ['@dest' => $_GET['destination']], WATCHDOG_DEBUG);
+        unset($_GET['destination']);
+    }
+    
+    $form_state['redirect'] = 'account';
+}
+
+/**
+ * =======================================================================================
+ * HELPER: _ozk_profielfoto_sync_profielfoto_naar_civicrm
+ * =======================================================================================
+ * Haalt de geüploade foto uit de Entityform en pusht ENKEL de absolute URL naar CiviCRM.
+ * Dit triggert automatisch de intake_civicrm_pre hook in intake.php, die de 
+ * datums (custom_2253 en custom_1798) perfect en zonder timing-conflicten beheert.
+ */
+function _ozk_profielfoto_sync_profielfoto_naar_civicrm($entity) {
+	$extdebug				= 'intake.profielfoto'; 
+
+	// 1. Controleer of er een bestand is geüpload
+	$field_data				= field_get_items('entityform', $entity, 'field_profielfoto');
+	
+	if (!$field_data || empty($field_data[0]['uri'])) {
+		return; 
+	}
+
+	// 2. Converteer de Drupal URI naar een absolute URL
+	$file_uri				= $field_data[0]['uri'];
+	$image_url				= file_create_url($file_uri);
+
+	if (!civicrm_initialize()) {
+		return;
+	}
+	
+	$uid					= $entity->uid;
+	$contact_id				= CRM_Core_BAO_UFMatch::getContactId($uid);
+
+	if ($contact_id) {
+		
+		wachthond($extdebug, 2, "########################################################################");
+		wachthond($extdebug, 1, "### DRUPAL SYNC: PROFIELFOTO NAAR CIVICRM PUSHEN",		"[CID: $contact_id]");
+		wachthond($extdebug, 2, "########################################################################");
+
+		// 3. APIv4 Parameters opbouwen (Alleen URL, intake.php pre-hook doet de rest)
+		$params_update_foto = [
+			'checkPermissions'	=> FALSE,
+			'where'				=> [['id', '=', $contact_id]],
+			'values'			=> ['image_URL' => $image_url],
+		];
+		
+		wachthond($extdebug, 7, 'params_update_foto',			$params_update_foto);
+
+		try {
+			// 4. Push Foto URL via APIv4
+			$result_foto	= civicrm_api4('Contact', 'update', $params_update_foto);
+			wachthond($extdebug, 9, 'result_foto',					$result_foto);
+			
+			watchdog('ozk_profielfoto', "Profielfoto URL succesvol gesynchroniseerd voor CID: $contact_id", NULL, WATCHDOG_INFO);
+
+			// 5. E-mail notificatie versturen (met Ymd_His timestamp)
+			// ... binnen de _ozk_profielfoto_sync_profielfoto_naar_civicrm functie ...
+
+			// Displayname ophalen via APIv4
+			$params_contact_naam = [
+				'checkPermissions' => FALSE,
+				'debug'            => FALSE,
+				'select'           => ['display_name'],
+				'where'            => [['id', '=', $contact_id]],
+			];
+			wachthond($extdebug, 7, 'params_contact_naam',  $params_contact_naam);
+			$result_contact_naam = civicrm_api4('Contact', 'get', $params_contact_naam);
+			wachthond($extdebug, 9, 'result_contact_naam',  $result_contact_naam);
+			$display_name        = $result_contact_naam->first()['display_name'] ?? '(onbekend)';
+
+			// Ditjaar kampkort en kampfunctie via base_find_allpart
+			$allpart_array       = function_exists('base_find_allpart') ? base_find_allpart($contact_id) : FALSE;
+			$ditjaar_kampkort    = $allpart_array ? ($allpart_array['result_allpart_one_kampkort']    ?? NULL) : NULL;
+			$ditjaar_kampfunctie = $allpart_array ? ($allpart_array['result_allpart_one_kampfunctie'] ?? NULL) : NULL;
+			wachthond($extdebug, 3, 'ditjaar_kampkort',     $ditjaar_kampkort);
+			wachthond($extdebug, 3, 'ditjaar_kampfunctie',  $ditjaar_kampfunctie);
+
+			$email_to       = 'richard.van.oosterhout@gmail.com';
+			$email_subject  = '[CRM] Profielfoto update - ' . date('Ymd_His');
+
+			// We bouwen de HTML body op met de echte $image_url die we zojuist hebben gemaakt
+			$email_bericht  = '<html><body>';
+			$email_bericht .= 'Profielfoto aangepast voor Contact ID: ' . $contact_id;
+			$email_bericht .= ' &mdash; <b>' . htmlspecialchars($display_name) . '</b><br>';
+			if ($ditjaar_kampkort || $ditjaar_kampfunctie) {
+				$email_bericht .= 'Kamp: ' . htmlspecialchars($ditjaar_kampkort ?? '?');
+				$email_bericht .= ' &mdash; Functie: ' . htmlspecialchars($ditjaar_kampfunctie ?? '?');
+				$email_bericht .= '<br>';
+			}
+			$email_bericht .= '<br><hr>';
+			$email_bericht .= '<h3><b>Profielfoto</b></h3>';
+			$email_bericht .= '<a href="https://www.ozk_profielfoto.nl/account">';
+			$email_bericht .= '<img src="' . $image_url . '" width="256px" style="border: 3px solid #A7A7A7; padding: 3px; margin: 3px;">';
+			$email_bericht .= '</a><br><hr>';
+			$email_bericht .= '</body></html>';
+
+			// Stel de juiste headers in voor HTML e-mail
+			$email_headers  = "MIME-Version: 1.0" . "\r\n";
+			$email_headers .= "Content-type:text/html;charset=UTF-8" . "\r\n";
+			$email_headers .= "From: noreply@ozk_profielfoto.nl" . "\r\n";
+
+			_ozk_profielfoto_mail($email_to, $email_subject, $email_bericht, $email_headers);
+
+			wachthond($extdebug, 3, "E-mail notificatie verzonden naar",	$email_to);
+
+		} catch (\Exception $e) {
+			$error_msg			= $e->getMessage();
+			wachthond($extdebug, 1, "FATAAL: Fout bij pushen profielfoto naar CiviCRM",	$error_msg);
+			watchdog('ozk_profielfoto', "Fout bij pushen profielfoto: $error_msg", NULL, WATCHDOG_ERROR);
+		}
+	} else {
+		watchdog('ozk_profielfoto', "Geen CiviCRM contact gevonden voor Drupal UID: $uid", NULL, WATCHDOG_WARNING);
+	}
+}
+
+/**
+ * Wrapper rond mail() zodat de aanroep unit-testbaar is.
+ * In productie roept dit gewoon de PHP mail()-functie aan.
+ * In tests wordt deze functie eerder gedefinieerd door de bootstrap-stub.
+ */
+if (!function_exists('_ozk_profielfoto_mail')) {
+    function _ozk_profielfoto_mail(string $to, string $subject, string $message, string $headers = ''): bool {
+        return mail($to, $subject, $message, $headers);
+    }
+}

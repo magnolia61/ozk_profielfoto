@@ -1,0 +1,4 @@
+name = OZK Profielfoto
+description = "Synchroniseert profielfoto's van entityform-inzendingen naar CiviCRM."
+core = 7.x
+package = OZK
