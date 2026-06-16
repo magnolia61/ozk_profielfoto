@@ -67,15 +67,28 @@ function _ozk_profielfoto_sync_profielfoto_naar_civicrm($entity) {
 		return; 
 	}
 
-	// 2. Converteer de Drupal URI naar een absolute URL
-	$file_uri				= $field_data[0]['uri'];
-	$image_url				= file_create_url($file_uri);
+	// 2. Converteer de Drupal URI naar een absolute URL en delegeer de CiviCRM-sync.
+	$image_url				= file_create_url($field_data[0]['uri']);
+	_ozk_profielfoto_push_image_url_naar_civicrm($entity->uid, $image_url);
+}
+
+/**
+ * =======================================================================================
+ * HELPER (testbare seam): _ozk_profielfoto_push_image_url_naar_civicrm
+ * =======================================================================================
+ * Pusht een absolute image-URL naar CiviCRM voor een gegeven Drupal-UID en stuurt de
+ * notificatiemail. Afgesplitst van _ozk_profielfoto_sync_profielfoto_naar_civicrm() zodat
+ * e2e-tests de volledige sync -> intake-pre-hook -> DB-keten kunnen draaien zonder de
+ * Drupal-only field_get_items()/file_create_url() te stubben (die in de e2e-boot niet te
+ * overschrijven zijn omdat Drupal's eigen versie al geladen is).
+ */
+function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url) {
+	$extdebug				= 'intake.profielfoto';
 
 	if (!civicrm_initialize()) {
 		return;
 	}
-	
-	$uid					= $entity->uid;
+
 	$contact_id				= CRM_Core_BAO_UFMatch::getContactId($uid);
 
 	if ($contact_id) {
