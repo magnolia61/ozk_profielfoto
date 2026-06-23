@@ -138,28 +138,76 @@ function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url) {
 			$email_to       = 'richard.van.oosterhout@gmail.com';
 			$email_subject  = '[CRM] Profielfoto update - ' . date('Ymd_His');
 
-			// We bouwen de HTML body op met de echte $image_url die we zojuist hebben gemaakt
+			// Link naar het CiviCRM-contactrecord (admin is ingelogd). Dient tevens als
+			// betrouwbare fallback: mailclients blokkeren/proxyen vaak de inline-hotlink van
+			// een externe afbeelding, dus via deze link is de foto altijd te bekijken.
+			$contact_view_url = 'https://www.onvergetelijk.nl/civicrm/contact/view?reset=1&cid=' . $contact_id;
+
+			// --- Kan de foto INLINE mee (cid) i.p.v. hotlinken? ---
+			// Leid het lokale bestandspad af uit de absolute URL. Lukt dat en is het een
+			// leesbaar plaatje, dan sturen we 'm inline mee (multipart/related + Content-ID):
+			// de afbeelding zit dan ÍN de mail, dus de client hoeft niets extern op te halen
+			// -> altijd zichtbaar, ongeacht image-proxy/blokkade/afzenderreputatie. Anders
+			// vallen we terug op de hotlink-<img> (huidig gedrag).
+			$webroot   = '/var/www/vhosts/ozkprod/web';
+			$urlPath   = parse_url($image_url, PHP_URL_PATH);
+			$urlPath   = preg_replace('#/styles/[^/]+/public#', '', (string) $urlPath);   // defensief: styled -> origineel
+			$localPath = $webroot . urldecode((string) $urlPath);
+			$ext       = strtolower(pathinfo($localPath, PATHINFO_EXTENSION));
+			$mimeMap   = ['jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg', 'png' => 'image/png', 'gif' => 'image/gif'];
+			$canEmbed  = isset($mimeMap[$ext]) && is_file($localPath) && is_readable($localPath);
+
+			// HTML-body (de <img>-bron verschilt: cid bij inline, anders de hotlink-URL).
+			$imgSrc = $canEmbed ? 'cid:profielfoto' : $image_url;
 			$email_bericht  = '<html><body>';
-			$email_bericht .= 'Profielfoto aangepast voor Contact ID: ' . $contact_id;
-			$email_bericht .= ' &mdash; <b>' . htmlspecialchars($display_name) . '</b><br>';
+			$email_bericht .= 'Profielfoto aangepast voor Contact ID: ' . $contact_id . '<br>';
+			$email_bericht .= '<b>' . htmlspecialchars($display_name) . '</b><br>';   // naam op eigen regel
 			if ($ditjaar_kampkort || $ditjaar_kampfunctie) {
 				$email_bericht .= 'Kamp: ' . htmlspecialchars($ditjaar_kampkort ?? '?');
 				$email_bericht .= ' &mdash; Functie: ' . htmlspecialchars($ditjaar_kampfunctie ?? '?');
 				$email_bericht .= '<br>';
 			}
+			$email_bericht .= '<br><i>Deze foto is geüpload via het entityform (zelf-upload door de gebruiker).</i><br>';
 			$email_bericht .= '<br><hr>';
 			$email_bericht .= '<h3><b>Profielfoto</b></h3>';
-			$email_bericht .= '<a href="https://www.ozk_profielfoto.nl/account">';
-			$email_bericht .= '<img src="' . $image_url . '" width="256px" style="border: 3px solid #A7A7A7; padding: 3px; margin: 3px;">';
+			$email_bericht .= '<a href="' . $contact_view_url . '">';
+			$email_bericht .= '<img src="' . $imgSrc . '" width="256px" style="border: 3px solid #A7A7A7; padding: 3px; margin: 3px;">';
 			$email_bericht .= '</a><br><hr>';
+			$email_bericht .= '<a href="' . $contact_view_url . '">&raquo; Open contactrecord in CiviCRM</a><br>';
 			$email_bericht .= '</body></html>';
 
-			// Stel de juiste headers in voor HTML e-mail
-			$email_headers  = "MIME-Version: 1.0" . "\r\n";
-			$email_headers .= "Content-type:text/html;charset=UTF-8" . "\r\n";
-			$email_headers .= "From: noreply@ozk_profielfoto.nl" . "\r\n";
+			if ($canEmbed) {
+				// multipart/related: HTML-deel + inline-afbeelding gekoppeld via Content-ID.
+				$boundary       = 'ozkfoto_' . md5(uniqid('', TRUE));
+				$imgFilename    = basename($localPath);
+				$imgData        = chunk_split(base64_encode(file_get_contents($localPath)));
 
-			_ozk_profielfoto_mail($email_to, $email_subject, $email_bericht, $email_headers);
+				$email_headers  = "MIME-Version: 1.0" . "\r\n";
+				$email_headers .= "From: noreply@onvergetelijk.nl" . "\r\n";
+				$email_headers .= "Content-Type: multipart/related; boundary=\"$boundary\"" . "\r\n";
+
+				$body  = "--$boundary\r\n";
+				$body .= "Content-Type: text/html; charset=UTF-8\r\n";
+				$body .= "Content-Transfer-Encoding: 8bit\r\n\r\n";
+				$body .= $email_bericht . "\r\n\r\n";
+				$body .= "--$boundary\r\n";
+				$body .= "Content-Type: {$mimeMap[$ext]}; name=\"$imgFilename\"\r\n";
+				$body .= "Content-Transfer-Encoding: base64\r\n";
+				$body .= "Content-ID: <profielfoto>\r\n";
+				$body .= "Content-Disposition: inline; filename=\"$imgFilename\"\r\n\r\n";
+				$body .= $imgData . "\r\n";
+				$body .= "--$boundary--";
+
+				_ozk_profielfoto_mail($email_to, $email_subject, $body, $email_headers);
+			}
+			else {
+				// Fallback: enkelvoudige HTML-mail met hotlink-afbeelding.
+				$email_headers  = "MIME-Version: 1.0" . "\r\n";
+				$email_headers .= "Content-Type: text/html; charset=UTF-8" . "\r\n";
+				$email_headers .= "From: noreply@onvergetelijk.nl" . "\r\n";
+
+				_ozk_profielfoto_mail($email_to, $email_subject, $email_bericht, $email_headers);
+			}
 
 			wachthond($extdebug, 3, "E-mail notificatie verzonden naar",	$email_to);
 
