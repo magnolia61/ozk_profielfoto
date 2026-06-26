@@ -53,23 +53,27 @@ function _ozk_profielfoto_profielfoto_redirect_force($form, &$form_state) {
  * =======================================================================================
  * HELPER: _ozk_profielfoto_sync_profielfoto_naar_civicrm
  * =======================================================================================
- * Haalt de geüploade foto uit de Entityform en pusht ENKEL de absolute URL naar CiviCRM.
- * Dit triggert automatisch de intake_civicrm_pre hook in intake.php, die de 
+ * Haalt de geüploade foto uit de Entityform en pusht de gecropte URL naar CiviCRM.
+ * De square_profielfoto image style past de manualcrop-selectie van de gebruiker toe.
+ * Dit triggert automatisch de intake_civicrm_pre hook in intake.php, die de
  * datums (custom_2253 en custom_1798) perfect en zonder timing-conflicten beheert.
  */
 function _ozk_profielfoto_sync_profielfoto_naar_civicrm($entity) {
-	$extdebug				= 'intake.profielfoto'; 
+	$extdebug				= 'intake.profielfoto';
 
 	// 1. Controleer of er een bestand is geüpload
 	$field_data				= field_get_items('entityform', $entity, 'field_profielfoto');
-	
+
 	if (!$field_data || empty($field_data[0]['uri'])) {
-		return; 
+		return;
 	}
 
-	// 2. Converteer de Drupal URI naar een absolute URL en delegeer de CiviCRM-sync.
-	$image_url				= file_create_url($field_data[0]['uri']);
-	_ozk_profielfoto_push_image_url_naar_civicrm($entity->uid, $image_url);
+	// 2. Gebruik de square_profielfoto styled URL voor CiviCRM zodat de manualcrop
+	//    selectie van de gebruiker ook in het CiviCRM-profielfoto-veld terecht komt.
+	//    De originele Drupal URI wordt meegegeven voor de mail-thumbnail generatie.
+	$drupal_uri             = $field_data[0]['uri'];
+	$image_url              = image_style_url('square_profielfoto', $drupal_uri);
+	_ozk_profielfoto_push_image_url_naar_civicrm($entity->uid, $image_url, $drupal_uri);
 }
 
 /**
@@ -81,8 +85,11 @@ function _ozk_profielfoto_sync_profielfoto_naar_civicrm($entity) {
  * e2e-tests de volledige sync -> intake-pre-hook -> DB-keten kunnen draaien zonder de
  * Drupal-only field_get_items()/file_create_url() te stubben (die in de e2e-boot niet te
  * overschrijven zijn omdat Drupal's eigen versie al geladen is).
+ *
+ * @param string      $image_url   Gecropte absolute URL (square_profielfoto style) → naar CiviCRM
+ * @param string|null $drupal_uri  Originele Drupal URI (public://...) voor mail-thumbnail generatie
  */
-function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url) {
+function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url, $drupal_uri = NULL) {
 	$extdebug				= 'intake.profielfoto';
 
 	if (!civicrm_initialize()) {
@@ -144,18 +151,33 @@ function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url) {
 			$contact_view_url = 'https://www.onvergetelijk.nl/civicrm/contact/view?reset=1&cid=' . $contact_id;
 
 			// --- Kan de foto INLINE mee (cid) i.p.v. hotlinken? ---
-			// Leid het lokale bestandspad af uit de absolute URL. Lukt dat en is het een
-			// leesbaar plaatje, dan sturen we 'm inline mee (multipart/related + Content-ID):
-			// de afbeelding zit dan ÍN de mail, dus de client hoeft niets extern op te halen
-			// -> altijd zichtbaar, ongeacht image-proxy/blokkade/afzenderreputatie. Anders
-			// vallen we terug op de hotlink-<img> (huidig gedrag).
-			$webroot   = '/var/www/vhosts/ozkprod/web';
-			$urlPath   = parse_url($image_url, PHP_URL_PATH);
-			$urlPath   = preg_replace('#/styles/[^/]+/public#', '', (string) $urlPath);   // defensief: styled -> origineel
-			$localPath = $webroot . urldecode((string) $urlPath);
-			$ext       = strtolower(pathinfo($localPath, PATHINFO_EXTENSION));
+			// Voor de mail gebruiken we square_profielfoto_small (256×256): gecropte versie
+			// maar compact genoeg om inline mee te sturen. We genereren de derivative on-the-fly
+			// als die nog niet bestaat. Fallback op hotlink als het lokale pad niet beschikbaar is.
 			$mimeMap   = ['jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg', 'png' => 'image/png', 'gif' => 'image/gif'];
-			$canEmbed  = isset($mimeMap[$ext]) && is_file($localPath) && is_readable($localPath);
+			$localPath = FALSE;
+			if ($drupal_uri) {
+				$mail_style    = 'square_profielfoto_small';
+				$mail_dest_uri = image_style_path($mail_style, $drupal_uri);
+				if (!file_exists(drupal_realpath($mail_dest_uri))) {
+					// Derivative bestaat nog niet: genereer hem nu.
+					$style_def = image_style_load($mail_style);
+					if ($style_def) {
+						image_style_create_derivative($style_def, $drupal_uri, $mail_dest_uri);
+					}
+				}
+				$localPath = drupal_realpath($mail_dest_uri) ?: FALSE;
+			}
+			if (!$localPath) {
+				// Fallback: leid pad af uit de $image_url (zoals voorheen, zonder styled-strip).
+				$webroot   = '/var/www/vhosts/ozkprod/web';
+				$urlPath   = parse_url($image_url, PHP_URL_PATH);
+				$localPath = $webroot . urldecode((string) $urlPath);
+			}
+			$ext      = strtolower(pathinfo($localPath, PATHINFO_EXTENSION));
+			// Geen bestanden > 2 MB inline sturen (voorkomt lege base64 bij geheugentekort).
+			$filesize = is_file($localPath) ? filesize($localPath) : 0;
+			$canEmbed = isset($mimeMap[$ext]) && is_file($localPath) && is_readable($localPath) && $filesize > 0 && $filesize < 2 * 1024 * 1024;
 
 			// HTML-body (de <img>-bron verschilt: cid bij inline, anders de hotlink-URL).
 			$imgSrc = $canEmbed ? 'cid:profielfoto' : $image_url;
