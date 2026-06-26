@@ -151,16 +151,15 @@ function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url, $drupal_
 			$contact_view_url = 'https://www.onvergetelijk.nl/civicrm/contact/view?reset=1&cid=' . $contact_id;
 
 			// --- Kan de foto INLINE mee (cid) i.p.v. hotlinken? ---
-			// Voor de mail gebruiken we square_profielfoto_small (256×256): gecropte versie
-			// maar compact genoeg om inline mee te sturen. We genereren de derivative on-the-fly
-			// als die nog niet bestaat. Fallback op hotlink als het lokale pad niet beschikbaar is.
+			// Voor de mail gebruiken we square_0260 (polaroid, 260×320 JPEG) als basis en
+			// renderen de voornaam er met GD over in het witte balkje onderaan.
+			// Fallback op hotlink als het lokale pad niet beschikbaar is.
 			$mimeMap   = ['jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg', 'png' => 'image/png', 'gif' => 'image/gif'];
 			$localPath = FALSE;
 			if ($drupal_uri) {
-				$mail_style    = 'square_profielfoto_small';
+				$mail_style    = 'square_0260';
 				$mail_dest_uri = image_style_path($mail_style, $drupal_uri);
 				if (!file_exists(drupal_realpath($mail_dest_uri))) {
-					// Derivative bestaat nog niet: genereer hem nu.
 					$style_def = image_style_load($mail_style);
 					if ($style_def) {
 						image_style_create_derivative($style_def, $drupal_uri, $mail_dest_uri);
@@ -169,7 +168,7 @@ function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url, $drupal_
 				$localPath = drupal_realpath($mail_dest_uri) ?: FALSE;
 			}
 			if (!$localPath) {
-				// Fallback: leid pad af uit de $image_url (zoals voorheen, zonder styled-strip).
+				// Fallback: leid pad af uit de $image_url.
 				$webroot   = '/var/www/vhosts/ozkprod/web';
 				$urlPath   = parse_url($image_url, PHP_URL_PATH);
 				$localPath = $webroot . urldecode((string) $urlPath);
@@ -179,31 +178,58 @@ function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url, $drupal_
 			$filesize = is_file($localPath) ? filesize($localPath) : 0;
 			$canEmbed = isset($mimeMap[$ext]) && is_file($localPath) && is_readable($localPath) && $filesize > 0 && $filesize < 2 * 1024 * 1024;
 
-			// Converteer de derivative on-the-fly naar JPEG voor de mail.
-			// PNG op schijf (derivative) blijft ongewijzigd voor de site; de mail krijgt
-			// een compacte JPEG (~15-30 KB in plaats van ~300 KB PNG).
+			// Render voornaam op de polaroid in het witte balkje (GD + Rambla-Bold).
+			// Polaroid is 260×320: witte balk onderaan ~74px hoog, centrum op y≈283.
+			// Geen entity-context in deze codepath → naam uit $display_name afleiden.
 			$imgBytes    = NULL;
 			$imgMimeType = $canEmbed ? $mimeMap[$ext] : NULL;
 			$imgFilename = $canEmbed ? basename($localPath) : NULL;
-			if ($canEmbed && function_exists('imagecreatefromstring')) {
+			if ($canEmbed && function_exists('imagecreatefromstring') && function_exists('imagettftext')) {
 				$rawBytes = file_get_contents($localPath);
 				if ($rawBytes !== FALSE) {
 					$gdImg = @imagecreatefromstring($rawBytes);
 					if ($gdImg !== FALSE) {
+						// Voornaam = eerste woord van display_name
+						$voornaam  = explode(' ', trim($display_name))[0];
+						$font      = '/var/www/vhosts/ozkprod/web/sites/default/files/ozkcontent/Rambla-Bold.ttf';
+						$fontsize  = 18;
+						$color     = imagecolorallocate($gdImg, 51, 51, 51);
+						$imgW      = imagesx($gdImg);
+						$imgH      = imagesy($gdImg);
+						// Bereken tekstbreedte voor horizontale centrering
+						$bbox      = imagettfbbox($fontsize, 0, $font, $voornaam);
+						$textW     = abs($bbox[2] - $bbox[0]);
+						$xText     = (int)(($imgW - $textW) / 2);
+						// Baseline op centrum witte balk (283px van boven in 320px hoge afbeelding)
+						$yText     = (int)($imgH * 0.885);
+						imagettftext($gdImg, $fontsize, 0, $xText, $yText, $color, $font, $voornaam);
 						ob_start();
-						imagejpeg($gdImg, NULL, 78);
+						imagejpeg($gdImg, NULL, 85);
 						$jpegBytes = ob_get_clean();
 						imagedestroy($gdImg);
 						if ($jpegBytes !== FALSE && strlen($jpegBytes) > 0) {
 							$imgBytes    = $jpegBytes;
 							$imgMimeType = 'image/jpeg';
 							$imgFilename = preg_replace('/\.\w+$/', '.jpg', $imgFilename);
+							// Wegschrijven naar square_0260_naam derivative-pad zodat de URL
+							// direct opvraagbaar is (view hoeft pipeline niet te draaien).
+							if ($drupal_uri) {
+								$naam_dest_uri = image_style_path('square_0260_naam', $drupal_uri);
+								$naam_dir_uri  = 'public://styles/square_0260_naam/public/' . dirname(str_replace('public://', '', $drupal_uri));
+								file_prepare_directory($naam_dir_uri, FILE_CREATE_DIRECTORY);
+								$naam_local = str_replace(
+									'public://',
+									'/var/www/vhosts/ozkprod/web/sites/default/files/',
+									$naam_dest_uri
+								);
+								file_put_contents($naam_local, $jpegBytes);
+							}
 						}
 					}
 				}
 			}
 			if ($canEmbed && $imgBytes === NULL) {
-				// GD-conversie mislukt: lees origineel PNG in.
+				// GD-rendering mislukt: stuur derivative onbewerkt.
 				$imgBytes = file_get_contents($localPath) ?: NULL;
 			}
 			$canEmbed = $canEmbed && ($imgBytes !== NULL);
