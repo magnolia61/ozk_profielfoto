@@ -179,6 +179,35 @@ function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url, $drupal_
 			$filesize = is_file($localPath) ? filesize($localPath) : 0;
 			$canEmbed = isset($mimeMap[$ext]) && is_file($localPath) && is_readable($localPath) && $filesize > 0 && $filesize < 2 * 1024 * 1024;
 
+			// Converteer de derivative on-the-fly naar JPEG voor de mail.
+			// PNG op schijf (derivative) blijft ongewijzigd voor de site; de mail krijgt
+			// een compacte JPEG (~15-30 KB in plaats van ~300 KB PNG).
+			$imgBytes    = NULL;
+			$imgMimeType = $canEmbed ? $mimeMap[$ext] : NULL;
+			$imgFilename = $canEmbed ? basename($localPath) : NULL;
+			if ($canEmbed && function_exists('imagecreatefromstring')) {
+				$rawBytes = file_get_contents($localPath);
+				if ($rawBytes !== FALSE) {
+					$gdImg = @imagecreatefromstring($rawBytes);
+					if ($gdImg !== FALSE) {
+						ob_start();
+						imagejpeg($gdImg, NULL, 78);
+						$jpegBytes = ob_get_clean();
+						imagedestroy($gdImg);
+						if ($jpegBytes !== FALSE && strlen($jpegBytes) > 0) {
+							$imgBytes    = $jpegBytes;
+							$imgMimeType = 'image/jpeg';
+							$imgFilename = preg_replace('/\.\w+$/', '.jpg', $imgFilename);
+						}
+					}
+				}
+			}
+			if ($canEmbed && $imgBytes === NULL) {
+				// GD-conversie mislukt: lees origineel PNG in.
+				$imgBytes = file_get_contents($localPath) ?: NULL;
+			}
+			$canEmbed = $canEmbed && ($imgBytes !== NULL);
+
 			// HTML-body (de <img>-bron verschilt: cid bij inline, anders de hotlink-URL).
 			$imgSrc = $canEmbed ? 'cid:profielfoto' : $image_url;
 			$email_bericht  = '<html><body>';
@@ -200,9 +229,9 @@ function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url, $drupal_
 
 			if ($canEmbed) {
 				// multipart/related: HTML-deel + inline-afbeelding gekoppeld via Content-ID.
+				// $imgBytes/$imgMimeType/$imgFilename zijn gezet in het JPEG-conversie-blok hierboven.
 				$boundary       = 'ozkfoto_' . md5(uniqid('', TRUE));
-				$imgFilename    = basename($localPath);
-				$imgData        = chunk_split(base64_encode(file_get_contents($localPath)));
+				$imgData        = chunk_split(base64_encode($imgBytes));
 
 				$email_headers  = "MIME-Version: 1.0" . "\r\n";
 				$email_headers .= "From: noreply@onvergetelijk.nl" . "\r\n";
@@ -213,7 +242,7 @@ function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url, $drupal_
 				$body .= "Content-Transfer-Encoding: 8bit\r\n\r\n";
 				$body .= $email_bericht . "\r\n\r\n";
 				$body .= "--$boundary\r\n";
-				$body .= "Content-Type: {$mimeMap[$ext]}; name=\"$imgFilename\"\r\n";
+				$body .= "Content-Type: {$imgMimeType}; name=\"$imgFilename\"\r\n";
 				$body .= "Content-Transfer-Encoding: base64\r\n";
 				$body .= "Content-ID: <profielfoto>\r\n";
 				$body .= "Content-Disposition: inline; filename=\"$imgFilename\"\r\n\r\n";
