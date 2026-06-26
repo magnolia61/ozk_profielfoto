@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         bootstrap="tests/phpunit/bootstrap.php"
+         colors="true"
+         cacheResult="false"
+         convertErrorsToExceptions="true"
+         convertWarningsToExceptions="true"
+         convertNoticesToExceptions="true">
+  <testsuites>
+    <testsuite name="ozk_profielfoto">
+      <directory suffix="Test.php">tests/phpunit</directory>
+    </testsuite>
+  </testsuites>
+</phpunit>

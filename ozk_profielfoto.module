@@ -30,10 +30,126 @@ function ozk_profielfoto_form_alter(&$form, &$form_state, $form_id) {
             
             // DEBUG: Bevestig dat de alter is geladen
             watchdog('ozk_profielfoto', "Form alter actief voor: @id", ['@id' => $form_id], WATCHDOG_DEBUG);
-            
+
             $form['actions']['submit']['#submit'][] = '_ozk_profielfoto_profielfoto_redirect_force';
+
+            // HEIC/HEIF accepteren: hang onze converter vooraan de upload-validators
+            // van het fotoveld. Dit MOET hier (in form_alter, vóór form_builder),
+            // omdat managed_file de upload afhandelt in zijn #value_callback en niet
+            // in #process. Zie _ozk_profielfoto_validate_heic_naar_jpg().
+            if (isset($form['field_profielfoto'])) {
+                _ozk_profielfoto_heic_validator_inhaken($form['field_profielfoto']);
+            }
         }
     }
+}
+
+/**
+ * =======================================================================================
+ * HELPER: _ozk_profielfoto_heic_validator_inhaken
+ * =======================================================================================
+ * Loopt recursief door het field_profielfoto-formulierfragment en hangt op ELK element
+ * met #upload_validators onze HEIC->JPEG-converter VOORAAN, zodat die draait vóór de
+ * standaard image-validators (file_validate_is_image / file_validate_extensions).
+ * Tevens staan we .heic/.heif toe in de extensie-check (defensief; na conversie heet
+ * het bestand toch .jpg).
+ */
+function _ozk_profielfoto_heic_validator_inhaken(&$element) {
+    if (!is_array($element)) {
+        return;
+    }
+
+    if (isset($element['#upload_validators']) && is_array($element['#upload_validators'])) {
+        // 1. Extensie toestaan (defensief).
+        if (!empty($element['#upload_validators']['file_validate_extensions'][0])
+            && strpos($element['#upload_validators']['file_validate_extensions'][0], 'heic') === FALSE) {
+            $element['#upload_validators']['file_validate_extensions'][0] .= ' heic heif';
+        }
+        // 2. Converter VOORAAN (array-unie behoudt volgorde: links eerst).
+        if (!isset($element['#upload_validators']['_ozk_profielfoto_validate_heic_naar_jpg'])) {
+            $element['#upload_validators'] =
+                ['_ozk_profielfoto_validate_heic_naar_jpg' => []]
+                + $element['#upload_validators'];
+        }
+    }
+
+    // Recursief door de child-elementen (taal-container + delta's).
+    foreach (element_children($element) as $key) {
+        _ozk_profielfoto_heic_validator_inhaken($element[$key]);
+    }
+}
+
+/**
+ * =======================================================================================
+ * UPLOAD-VALIDATOR: _ozk_profielfoto_validate_heic_naar_jpg
+ * =======================================================================================
+ * Zet een geüploade HEIC/HEIF om naar JPEG. Draait als EERSTE upload-validator, terwijl
+ * $file->uri nog naar de geüploade tmp-file wijst. We overschrijven die tmp-file IN PLACE
+ * met de JPEG-bytes, want file_save_upload() verplaatst straks letterlijk
+ * $_FILES[...]['tmp_name'] (niet $file->uri) naar de bestemming. Daarna corrigeren we
+ * $file->filename naar .jpg, zodat de bestemming, de extensie-check en de latere
+ * image-validators (GD/getimagesize) allemaal een geldige JPEG zien.
+ *
+ * Achtergrond: Drupals image_get_info() leest afmetingen via getimagesize() (ook met de
+ * ImageMagick-toolkit, want image_imagemagick_get_info() gebruikt getimagesize()), en dat
+ * kan HEIC niet. Daarom converteren we hier zelf met de 'magick'-binary (libheif: rw+).
+ *
+ * @param stdClass $file  Het in-validatie zijnde bestand (uri = geüploade tmp-file).
+ * @return array          Lege array bij succes; foutmeldingen voor file_validate() bij falen.
+ */
+function _ozk_profielfoto_validate_heic_naar_jpg(stdClass $file) {
+    $extdebug = 'ozk_profielfoto';
+    $errors   = [];
+
+    // Fysiek pad naar het (tmp-)bestand bepalen. tmp-uploads zijn vaak een kaal abs. pad.
+    $pad = drupal_realpath($file->uri);
+    if (empty($pad) || !is_file($pad)) {
+        $pad = $file->uri;
+    }
+    if (!is_file($pad)) {
+        return $errors;
+    }
+
+    // HEIC/HEIF herkennen: ISO-BMFF 'ftyp'-merk in de header, of de extensie.
+    $kop     = (string) @file_get_contents($pad, FALSE, NULL, 0, 32);
+    $is_heic = (bool) preg_match('/ftyp(heic|heix|hevc|heim|heis|hevm|hevs|mif1|msf1)/', $kop)
+            || (bool) preg_match('/\.(heic|heif)$/i', $file->filename);
+    if (!$is_heic) {
+        return $errors; // geen HEIC -> niets doen, normale validatie loopt door
+    }
+
+    // Converteren: eerste frame, oriëntatie corrigeren, naar sRGB, metadata strippen.
+    $tmp_jpg = $pad . '.ozkconv.jpg';
+    $cmd     = sprintf('magick %s -auto-orient -colorspace sRGB -strip -quality 88 %s',
+                       escapeshellarg($pad . '[0]'), escapeshellarg($tmp_jpg));
+    exec($cmd, $uitvoer, $rv);
+
+    if ($rv !== 0 || !is_file($tmp_jpg) || filesize($tmp_jpg) === 0) {
+        @unlink($tmp_jpg);
+        watchdog($extdebug, 'HEIC-conversie mislukt voor %f (rv=@rv).',
+                 ['%f' => $file->filename, '@rv' => $rv], WATCHDOG_ERROR);
+        $errors[] = t('Deze foto (HEIC) kon niet worden verwerkt. Sla hem op als JPG en probeer het opnieuw.');
+        return $errors;
+    }
+
+    // tmp-upload IN PLACE vervangen door de JPEG (zelfde pad blijft een geldige upload).
+    if (!@rename($tmp_jpg, $pad)) {
+        @copy($tmp_jpg, $pad);
+        @unlink($tmp_jpg);
+    }
+
+    // Naam/mime gelijktrekken zodat bestemming + vervolgvalidators .jpg zien.
+    $file->filename = preg_replace('/\.(heic|heif)$/i', '.jpg', $file->filename);
+    if (!preg_match('/\.jpe?g$/i', $file->filename)) {
+        $file->filename .= '.jpg';
+    }
+    $file->filemime = 'image/jpeg';
+    if (isset($file->name)) {
+        $file->name = $file->filename;
+    }
+
+    watchdog($extdebug, 'HEIC/HEIF omgezet naar JPEG: %f', ['%f' => $file->filename], WATCHDOG_INFO);
+    return $errors;
 }
 
 /**
@@ -139,8 +255,24 @@ function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url, $drupal_
 			$allpart_array       = function_exists('base_find_allpart') ? base_find_allpart($contact_id) : FALSE;
 			$ditjaar_kampkort    = $allpart_array ? ($allpart_array['result_allpart_one_kampkort']    ?? NULL) : NULL;
 			$ditjaar_kampfunctie = $allpart_array ? ($allpart_array['result_allpart_one_kampfunctie'] ?? NULL) : NULL;
+			$ditjaar_event_id    = $allpart_array ? ($allpart_array['result_allpart_one_event_id']    ?? NULL) : NULL;
 			wachthond($extdebug, 3, 'ditjaar_kampkort',     $ditjaar_kampkort);
 			wachthond($extdebug, 3, 'ditjaar_kampfunctie',  $ditjaar_kampfunctie);
+
+			// Haal event-titel op als kamplang (lange naam voor indiener-mail).
+			$ditjaar_kampnaam = NULL;
+			if ($ditjaar_event_id) {
+				$params_event = [
+					'checkPermissions' => FALSE,
+					'select'           => ['title'],
+					'where'            => [['id', '=', $ditjaar_event_id]],
+				];
+				wachthond($extdebug, 7, 'params_event', $params_event);
+				$result_event     = civicrm_api4('Event', 'get', $params_event);
+				wachthond($extdebug, 9, 'result_event', $result_event);
+				$ditjaar_kampnaam = $result_event->first()['title'] ?? NULL;
+			}
+			wachthond($extdebug, 3, 'ditjaar_kampnaam', $ditjaar_kampnaam);
 
 			$email_to       = 'richard.van.oosterhout@gmail.com';
 			$email_subject  = '[CRM] Profielfoto update - ' . date('Ymd_His');
@@ -234,51 +366,190 @@ function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url, $drupal_
 			}
 			$canEmbed = $canEmbed && ($imgBytes !== NULL);
 
-			// HTML-body (de <img>-bron verschilt: cid bij inline, anders de hotlink-URL).
-			$imgSrc = $canEmbed ? 'cid:profielfoto' : $image_url;
-			$email_bericht  = '<html><body>';
-			$email_bericht .= 'Profielfoto aangepast voor Contact ID: ' . $contact_id . '<br>';
-			$email_bericht .= '<b>' . htmlspecialchars($display_name) . '</b><br>';   // naam op eigen regel
-			if ($ditjaar_kampkort || $ditjaar_kampfunctie) {
-				$email_bericht .= 'Kamp: ' . htmlspecialchars($ditjaar_kampkort ?? '?');
-				$email_bericht .= ' &mdash; Functie: ' . htmlspecialchars($ditjaar_kampfunctie ?? '?');
-				$email_bericht .= '<br>';
+			// Laad ook square_profielfoto als tweede inline afbeelding (kleine foto boven).
+			$squareBytes    = NULL;
+			$squareMimeType = NULL;
+			$squareFilename = NULL;
+			if ($drupal_uri) {
+				$sq_uri   = image_style_path('square_profielfoto', $drupal_uri);
+				if (!file_exists(drupal_realpath($sq_uri))) {
+					$sq_def = image_style_load('square_profielfoto');
+					if ($sq_def) {
+						image_style_create_derivative($sq_def, $drupal_uri, $sq_uri);
+					}
+				}
+				$sq_local = drupal_realpath($sq_uri) ?: FALSE;
+				if ($sq_local && is_file($sq_local) && filesize($sq_local) > 0 && filesize($sq_local) < 2 * 1024 * 1024) {
+					$squareBytes    = file_get_contents($sq_local) ?: NULL;
+					$squareMimeType = 'image/jpeg';
+					$squareFilename = basename($sq_local);
+				}
 			}
-			$email_bericht .= '<br><i>Deze foto is geüpload via het entityform (zelf-upload door de gebruiker).</i><br>';
-			$email_bericht .= '<br><hr>';
-			$email_bericht .= '<h3><b>Profielfoto</b></h3>';
-			$email_bericht .= '<a href="' . $contact_view_url . '">';
-			$email_bericht .= '<img src="' . $imgSrc . '" width="256px" style="border: 3px solid #A7A7A7; padding: 3px; margin: 3px;">';
-			$email_bericht .= '</a><br><hr>';
-			$email_bericht .= '<a href="' . $contact_view_url . '">&raquo; Open contactrecord in CiviCRM</a><br>';
-			$email_bericht .= '</body></html>';
 
-			if ($canEmbed) {
-				// multipart/related: HTML-deel + inline-afbeelding gekoppeld via Content-ID.
-				// $imgBytes/$imgMimeType/$imgFilename zijn gezet in het JPEG-conversie-blok hierboven.
-				$boundary       = 'ozkfoto_' . md5(uniqid('', TRUE));
-				$imgData        = chunk_split(base64_encode($imgBytes));
+			// Render template 608 via CiviCRM en embed afbeeldingen inline (cid:).
+			// Template params gespiegeld aan de normale send-aanroep.
+			$tpl_params = [
+				'fotoedit'   => 'https://www.onvergetelijk.nl/profielfoto',
+				'fotolink'   => $image_url,
+				'ozkweburl'  => 'https://www.onvergetelijk.nl',
+				'user_cid'   => $contact_id,
+			];
+			try {
+				$tpl_result  = \CRM_Core_BAO_MessageTemplate::renderTemplate([
+					'messageTemplateID' => 608,
+					'contactId'         => $contact_id,
+					'tplParams'         => $tpl_params,
+				]);
+				$tpl_html    = $tpl_result['html']    ?? NULL;
+				$tpl_subject = $tpl_result['subject']  ?? NULL;
+			} catch (\Throwable $renderEx) {
+				// Fallback: stel eigen minimale HTML in als render mislukt.
+				$tpl_html    = NULL;
+				$tpl_subject = $email_subject;
+				wachthond($extdebug, 1, 'Template 608 render mislukt', $renderEx->getMessage());
+			}
+
+			// Bouw de inline-embedded versie van de gerenderde HTML.
+			// Vervang de externe img src's door cid:-referenties.
+			$inlineImages = [];  // ['cid' => ..., 'mime' => ..., 'filename' => ..., 'bytes' => ...]
+
+			if ($tpl_html) {
+				// Verwijder de hele bovenste foto-rij (td class="fotocel" met de square_profielfoto) —
+				// notificatiemail toont alleen de polaroid. De fotocel reserveert 128px hoogte, dus de
+				// <img> alleen weghalen laat een leeg vak staan: de complete <tr> moet weg.
+				$tpl_html = preg_replace(
+					'/<tr>\s*<td\b[^>]*class="fotocel"[^>]*>.*?<\/td>\s*<\/tr>/s',
+					'',
+					$tpl_html
+				);
+				// Vangnet: losse <a><img class="profielfoto"></a> zonder fotocel-wrapper.
+				$tpl_html = preg_replace(
+					'/<a\b[^>]*>\s*<img\b[^>]*class="profielfoto"[^>]*>\s*<\/a>/s',
+					'',
+					$tpl_html
+				);
+				// Verwijder de smoelenboek-disclaimer — niet relevant in een beheerder/hoofdleiding-mail.
+				$tpl_html = preg_replace(
+					'/<tr>\s*<td\b[^>]*>\s*<small>\(Deze foto wordt vierkant.*?<\/small>\s*<\/td>\s*<\/tr>/s',
+					'',
+					$tpl_html
+				);
+				// Fallback: ook een eventuele contact/view-link weghalen.
+				$tpl_html = preg_replace(
+					'/<a\b[^>]*civicrm\/contact\/view[^>]*>.*?<\/a>/s',
+					'',
+					$tpl_html
+				);
+
+				// Maak displaynaam klikbaar naar CiviCRM contactrecord.
+				$tpl_html = str_replace(
+					htmlspecialchars($display_name),
+					'<a href="' . $contact_view_url . '" style="color:#c13c62;text-decoration:underline;">'
+						. htmlspecialchars($display_name) . '</a>',
+					$tpl_html
+				);
+				// square_0260_naam polaroid inline (cid:polaroid)
+				wachthond($extdebug, 3, 'notificatie: canEmbed / imgBytes-len',
+					[$canEmbed ? 'JA' : 'NEE', is_string($imgBytes) ? strlen($imgBytes) : gettype($imgBytes)]);
+				if ($canEmbed) {
+					$inlineImages[] = [
+						'cid'      => 'polaroid',
+						'mime'     => $imgMimeType,
+						'filename' => $imgFilename,
+						'bytes'    => $imgBytes,
+					];
+					$tpl_html = preg_replace(
+						'/src="https?:[^"]*square_0260[^"]*"/',
+						'src="cid:polaroid"',
+						$tpl_html
+					);
+				}
+				// cursor:default op alle foto-imgs
+				$tpl_html = preg_replace(
+					'/(<img\b[^>]*(?:cid:squarefoto|cid:polaroid)[^>]*)(style=")/',
+					'$1$2cursor:default;',
+					$tpl_html
+				);
+				// OZK-logo: begrens breedte zodat 1920px banner niet de volledige mail vult.
+				$tpl_html = preg_replace(
+					'/(OZK_banner[^"]*"[^>]*)\/>/',
+					'$1 style="display:block;width:360px;max-width:100%;height:auto;" />',
+					$tpl_html
+				);
+				// Vervang de parent-gerichte "Als u wilt kunt u de gegevens…"-regel door een
+				// whitesmoke divbtn naar de CiviCRM-contactkaart (beheerder/hoofdleiding-mail).
+				$gegevens_btn =
+					'<div style="padding:10px 20px;margin:8px 0;text-align:center;cursor:pointer;'
+					. 'background-color:whitesmoke;border:1px solid #ddd;">'
+					. '<a href="' . $contact_view_url . '" rel="noopener" target="_blank"'
+					. ' style="color:inherit;text-decoration:none;">» Gegevens '
+					. htmlspecialchars($display_name) . '</a></div>';
+				$tpl_html = preg_replace(
+					'/<p>\s*<small>\s*Als u wilt kunt u de gegevens.*?<\/small>\s*<\/p>/s',
+					$gegevens_btn,
+					$tpl_html,
+					1,
+					$count_btn
+				);
+				// Vangnet: als de regel niet voorkwam, hang de knop vóór </body>.
+				if (empty($count_btn)) {
+					$tpl_html = preg_replace('/<\/body>/', $gegevens_btn . '</body>', $tpl_html, 1);
+				}
+			}
+
+			$email_bericht = $tpl_html ?: (
+				// Minimale fallback als render volledig mislukte
+				'<html><body><p>' . htmlspecialchars($display_name) . '</p>'
+				. '<img src="' . $image_url . '" width="128">'
+				. '</body></html>'
+			);
+
+			// Toon in de beheerder-notificatie welk kamp én welke functie de foto betreft.
+			// kampkort komt uit base_find_allpart; kampfunctie werd voorheen wél opgehaald
+			// (regel ~257) maar nergens getoond — nu zichtbaar zodat de beheerder context heeft.
+			if ($ditjaar_kampkort || $ditjaar_kampfunctie) {
+				$kampinfo_parts = array_filter([$ditjaar_kampkort, $ditjaar_kampfunctie]);
+				$kampinfo_html  = '<p style="margin:8px 0;color:#555;">Kamp: '
+								. htmlspecialchars(implode(' — ', $kampinfo_parts)) . '</p>';
+				if (stripos($email_bericht, '</body>') !== FALSE) {
+					$email_bericht = preg_replace('/<\/body>/i', $kampinfo_html . '</body>', $email_bericht, 1);
+				} else {
+					$email_bericht .= $kampinfo_html;
+				}
+			}
+
+			if ($inlineImages) {
+				// multipart/related: HTML + inline afbeeldingen
+				$boundary = 'ozkfoto_' . md5(uniqid('', TRUE));
 
 				$email_headers  = "MIME-Version: 1.0" . "\r\n";
 				$email_headers .= "From: noreply@onvergetelijk.nl" . "\r\n";
 				$email_headers .= "Content-Type: multipart/related; boundary=\"$boundary\"" . "\r\n";
 
+				// HTML-part als base64 coderen: de cssinliner-output is één zeer lange regel
+				// (ver boven RFC-limiet 998 tekens). Met 8bit breekt de MTA die regel, wat de
+				// MIME-boundary-parsing verschuift en de daaropvolgende base64-bijlage dropt.
 				$body  = "--$boundary\r\n";
 				$body .= "Content-Type: text/html; charset=UTF-8\r\n";
-				$body .= "Content-Transfer-Encoding: 8bit\r\n\r\n";
-				$body .= $email_bericht . "\r\n\r\n";
-				$body .= "--$boundary\r\n";
-				$body .= "Content-Type: {$imgMimeType}; name=\"$imgFilename\"\r\n";
-				$body .= "Content-Transfer-Encoding: base64\r\n";
-				$body .= "Content-ID: <profielfoto>\r\n";
-				$body .= "Content-Disposition: inline; filename=\"$imgFilename\"\r\n\r\n";
-				$body .= $imgData . "\r\n";
+				$body .= "Content-Transfer-Encoding: base64\r\n\r\n";
+				$body .= chunk_split(base64_encode($email_bericht)) . "\r\n";
+
+				foreach ($inlineImages as $img) {
+					$body .= "--$boundary\r\n";
+					$body .= "Content-Type: {$img['mime']}; name=\"{$img['filename']}\"\r\n";
+					$body .= "Content-Transfer-Encoding: base64\r\n";
+					$body .= "Content-ID: <{$img['cid']}>\r\n";
+					$body .= "Content-Disposition: inline; filename=\"{$img['filename']}\"\r\n\r\n";
+					$body .= chunk_split(base64_encode($img['bytes'])) . "\r\n";
+				}
+
 				$body .= "--$boundary--";
 
+				wachthond($extdebug, 3, 'notificatie: body-len vlak voor verzenden', strlen($body));
 				_ozk_profielfoto_mail($email_to, $email_subject, $body, $email_headers);
 			}
 			else {
-				// Fallback: enkelvoudige HTML-mail met hotlink-afbeelding.
+				// Fallback: enkelvoudige HTML zonder inline afbeeldingen
 				$email_headers  = "MIME-Version: 1.0" . "\r\n";
 				$email_headers .= "Content-Type: text/html; charset=UTF-8" . "\r\n";
 				$email_headers .= "From: noreply@onvergetelijk.nl" . "\r\n";
@@ -287,6 +558,21 @@ function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url, $drupal_
 			}
 
 			wachthond($extdebug, 3, "E-mail notificatie verzonden naar",	$email_to);
+
+			// Stuur ook bevestigingsmail naar de indiener zelf.
+			_ozk_profielfoto_mail_indiener(
+				$contact_id,
+				$display_name,
+				$ditjaar_kampkort,
+				$ditjaar_kampnaam  ?? NULL,
+				$squareBytes,
+				$squareMimeType,
+				$squareFilename,
+				$imgBytes,
+				$imgMimeType,
+				$imgFilename
+			);
+			wachthond($extdebug, 3, "E-mail bevestiging verzonden naar indiener CID", $contact_id);
 
 		} catch (\Exception $e) {
 			$error_msg			= $e->getMessage();
@@ -299,12 +585,162 @@ function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url, $drupal_
 }
 
 /**
+ * Stuurt een bevestigingsmail naar de indiener (de contactpersoon zelf) na het
+ * uploaden van een profielfoto. Layout analoog aan template 608, met logo en
+ * beide foto's (pasfoto + polaroid) als inline base64-afbeeldingen.
+ */
+function _ozk_profielfoto_mail_indiener(
+	int    $contact_id,
+	string $display_name,
+	?string $ditjaar_kampkort,
+	?string $ditjaar_kampnaam,
+	?string $squareBytes,
+	?string $squareMimeType,
+	?string $squareFilename,
+	?string $imgBytes,
+	?string $imgMimeType,
+	?string $imgFilename
+): void {
+	// Haal primair e-mailadres en voornaam op.
+	$params_email = [
+		'checkPermissions' => FALSE,
+		'select'           => ['email_primary.email', 'first_name'],
+		'where'            => [['id', '=', $contact_id]],
+	];
+	$result_email  = civicrm_api4('Contact', 'get', $params_email);
+	$contact_row   = $result_email->first();
+	$to_email      = $contact_row['email_primary.email'] ?? NULL;
+	$voornaam      = $contact_row['first_name'] ?? explode(' ', trim($display_name))[0];
+
+	if (!$to_email) {
+		wachthond('ozk_profielfoto', 1, 'indiener-mail: geen e-mailadres voor CID', $contact_id);
+		return;
+	}
+
+	// Kamplang = event-titel als die beschikbaar is, anders kampkort.
+	$kamplang = $ditjaar_kampnaam ?: $ditjaar_kampkort ?: 'je kamp';
+
+	$ozk_url  = 'https://www.onvergetelijk.nl';
+
+	// Genereer een CiviCRM-checksum inloglink naar /form/inloglink.
+	// Fallback op /account als de checksum niet gegenereerd kan worden.
+	$login_url = $ozk_url . '/account';
+	$checksum = \CRM_Contact_BAO_Contact_Utils::generateChecksum($contact_id);
+	if ($checksum) {
+		$login_url = $ozk_url . '/form/inloglink?cid1=' . $contact_id . '&cs=' . $checksum;
+	}
+	$fotoedit = $login_url;
+
+	// Laad square_0260 polaroid als CID inline — betrouwbaarder dan externe URL
+	// (Gmail-cache kan externe URLs jarenlang als broken tonen na één mislukte fetch).
+	$polaroidBytes = NULL; $polaroidMime = 'image/jpeg'; $polaroidFilename = NULL;
+	if ($imgFilename) {
+		$drupal_uri_orig = 'public://profielfotos/' . $imgFilename;
+		$pol_uri = image_style_path('square_0260', $drupal_uri_orig);
+		$pol_realpath = drupal_realpath($pol_uri);
+		wachthond('ozk_profielfoto', 3, 'indiener: polaroid uri/realpath', [$pol_uri, $pol_realpath]);
+		if (!file_exists($pol_realpath)) {
+			$pol_def = image_style_load('square_0260');
+			if ($pol_def) { image_style_create_derivative($pol_def, $drupal_uri_orig, $pol_uri); }
+		}
+		$pol_local = $pol_realpath ?: FALSE;
+		if ($pol_local && is_file($pol_local) && filesize($pol_local) > 0) {
+			$rawPol           = file_get_contents($pol_local);
+			$polaroidBytes    = ($rawPol !== FALSE && strlen($rawPol) > 0) ? $rawPol : NULL;
+			$polaroidFilename = basename($pol_local);
+			wachthond('ozk_profielfoto', 3, 'indiener: polaroidBytes geladen', strlen($rawPol ?: '') . ' bytes');
+		} else {
+			wachthond('ozk_profielfoto', 1, 'indiener: polaroid bestand niet leesbaar', $pol_local);
+		}
+	} else {
+		wachthond('ozk_profielfoto', 1, 'indiener: imgFilename leeg, geen polaroid', $contact_id);
+	}
+
+	// OZK-logo als CID inline (360px breed, PNG).
+	$logo_path = '/var/www/vhosts/ozkprod/web/sites/default/files/ozkimages/huisstijl/OZK_banner_slogan_1920.png';
+	$logoBytes = is_file($logo_path) ? (file_get_contents($logo_path) ?: NULL) : NULL;
+	wachthond('ozk_profielfoto', 3, 'indiener: logoBytes', $logoBytes ? strlen($logoBytes) . ' bytes' : 'NULL');
+
+	$polarSrc = $polaroidBytes ? 'cid:polaroid' : $fotoedit;
+	$logoSrc  = $logoBytes    ? 'cid:sitelogo'  : ($ozk_url . '/sites/default/files/ozkimages/huisstijl/OZK_banner_slogan_1920.png');
+
+	// HTML opbouwen: polaroid met naam centraal, caption eronder, dan footer.
+	$html =
+		'<!DOCTYPE html><html lang="nl"><head><meta charset="utf-8">'
+		. '<meta name="viewport" content="width=device-width,initial-scale=1.0"></head>'
+		. '<body style="margin:0;padding:0;font-family:Arial,sans-serif;">'
+		. '<p style="margin-bottom:15px;line-height:1.4;margin-top:0;">Hallo ' . htmlspecialchars($voornaam) . ',</p>'
+		. '<p style="margin-top:0;margin-bottom:15px;line-height:1.4;">'
+		. 'De pasfoto van ' . htmlspecialchars($display_name) . ' voor ' . htmlspecialchars($kamplang) . ' is bijgewerkt.'
+		. '</p>'
+		// Polaroid met naam
+		. '<table style="border-collapse:collapse;margin-top:15px;margin-bottom:8px;">'
+		. '<tbody><tr><td style="padding:0;">'
+		. '<img src="' . $polarSrc . '" width="200" alt="Polaroid ' . htmlspecialchars($voornaam) . '"'
+		. ' style="display:block;pointer-events:none;cursor:default;"></td></tr>'
+		. '<tr><td style="padding:5px 0;"><small>(Deze foto wordt vierkant weergegeven in het smoelenboek.'
+		. ' Upload een <a href="' . $fotoedit . '" style="color:#c13c62;">nieuwe foto</a>'
+		. ' of snij hem online bij indien nodig.)</small></td></tr></tbody></table>'
+		// Footer: OZK-logo
+		. '<div style="display:block;margin:0;padding:0;">'
+		. '<a href="' . $ozk_url . '" style="color:#c13c62;text-decoration:underline;pointer-events:none;cursor:default;">'
+		. '<img src="' . $logoSrc . '" alt="Stichting Onvergetelijke Zomerkampen"'
+		. ' style="display:block;width:360px;max-width:100%;height:auto;"></a></div>'
+		// Inloglink als divbtn whitesmoke
+		. '<div style="padding:10px 20px;margin:8px 0;text-align:center;cursor:pointer;'
+		. 'background-color:whitesmoke;border:1px solid #ddd;">'
+		. '<a href="' . $login_url . '" rel="noopener" target="_blank"'
+		. ' style="color:inherit;text-decoration:none;">» Inloggen op Mijn OZK</a></div>'
+		. '</body></html>';
+
+	// Verzenden als multipart/related met inline afbeeldingen.
+	// squarefoto wordt niet meer getoond in de indiener-mail.
+	$subject = 'Je pasfoto voor ' . ($ditjaar_kampkort ?? 'je kamp') . ' is bijgewerkt';
+
+	$parts = [];
+	if ($polaroidBytes) {
+		$parts[] = ['cid' => 'polaroid', 'mime' => $polaroidMime, 'filename' => $polaroidFilename, 'bytes' => $polaroidBytes];
+	}
+	if ($logoBytes) {
+		$parts[] = ['cid' => 'sitelogo', 'mime' => 'image/png', 'filename' => 'ozk_logo.png', 'bytes' => $logoBytes];
+	}
+
+	if ($parts) {
+		$boundary      = 'ozkindien_' . md5(uniqid('', TRUE));
+		$email_headers = "MIME-Version: 1.0\r\nFrom: OZK <info@onvergetelijk.nl>\r\n"
+			. "Content-Type: multipart/related; boundary=\"$boundary\"\r\n";
+		// HTML-part als base64 (zie notificatie-flow: lange regels breken anders de MIME-parsing,
+		// waardoor de inline-bijlagen door de MTA worden gedropt).
+		$body  = "--$boundary\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n"
+			. chunk_split(base64_encode($html)) . "\r\n";
+		foreach ($parts as $p) {
+			$body .= "--$boundary\r\nContent-Type: {$p['mime']}; name=\"{$p['filename']}\"\r\n"
+				. "Content-Transfer-Encoding: base64\r\nContent-ID: <{$p['cid']}>\r\n"
+				. "Content-Disposition: inline; filename=\"{$p['filename']}\"\r\n\r\n"
+				. chunk_split(base64_encode($p['bytes'])) . "\r\n";
+		}
+		$body .= "--$boundary--";
+		_ozk_profielfoto_mail($to_email, $subject, $body, $email_headers);
+	}
+	else {
+		$email_headers = "MIME-Version: 1.0\r\nFrom: OZK <info@onvergetelijk.nl>\r\n"
+			. "Content-Type: text/html; charset=UTF-8\r\n";
+		_ozk_profielfoto_mail($to_email, $subject, $html, $email_headers);
+	}
+}
+
+/**
  * Wrapper rond mail() zodat de aanroep unit-testbaar is.
  * In productie roept dit gewoon de PHP mail()-functie aan.
  * In tests wordt deze functie eerder gedefinieerd door de bootstrap-stub.
  */
 if (!function_exists('_ozk_profielfoto_mail')) {
     function _ozk_profielfoto_mail(string $to, string $subject, string $message, string $headers = ''): bool {
+        // Normaliseer CRLF -> LF. De MTA is msmtp, die zelf LF -> CRLF maakt voor SMTP.
+        // Geven we al CRLF mee, dan wordt het \r\r\n en raakt de MIME-boundary-parsing aan
+        // de ontvangstkant (Gmail) in de war: de laatste part (inline-bijlage) valt dan weg.
+        $message = preg_replace("/\r\n|\r/", "\n", $message);
+        $headers = preg_replace("/\r\n|\r/", "\n", $headers);
         return mail($to, $subject, $message, $headers);
     }
 }

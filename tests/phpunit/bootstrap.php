@@ -49,6 +49,33 @@ function file_create_url(string $uri): string {
     return 'https://www.ozk_profielfoto.nl/' . ltrim($uri, '/');
 }
 
+if (!function_exists('t')) {
+    function t($string, array $args = []): string {
+        return empty($args) ? $string : strtr($string, $args);
+    }
+}
+
+if (!function_exists('drupal_realpath')) {
+    // In de tests geven we al echte filesystem-paden mee; geef ze ongewijzigd terug.
+    function drupal_realpath($uri) {
+        $real = @realpath($uri);
+        return $real !== FALSE ? $real : $uri;
+    }
+}
+
+if (!function_exists('element_children')) {
+    // Vereenvoudigde variant: alle sleutels die geen #property zijn.
+    function element_children(&$elements, $sort = FALSE): array {
+        $children = [];
+        foreach ($elements as $key => $value) {
+            if (is_int($key) || (is_string($key) && ($key === '' || $key[0] !== '#'))) {
+                $children[] = $key;
+            }
+        }
+        return $children;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CiviCRM-stubs
 // ---------------------------------------------------------------------------
