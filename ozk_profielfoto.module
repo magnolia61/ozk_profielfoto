@@ -5,9 +5,15 @@
  * Vervangt de Rule: "Entityform Profielfoto Upload"
  */
 function ozk_profielfoto_entity_insert($entity, $type) {
-	if ($type === 'entityform' && $entity->type === 'profielfoto') {
-		_ozk_profielfoto_sync_profielfoto_naar_civicrm($entity);
-	}
+    if ($type === 'entityform' && $entity->type === 'profielfoto') {
+        if (!defined('OZK_PROFIELFOTO_AUTOCROP_ALTIJD')) {
+            define('OZK_PROFIELFOTO_AUTOCROP_ALTIJD', TRUE);
+        }
+        if (OZK_PROFIELFOTO_AUTOCROP_ALTIJD || _ozk_profielfoto_is_mobiel()) {
+            _ozk_profielfoto_autocrop_op_gezicht($entity);
+        }
+        _ozk_profielfoto_sync_profielfoto_naar_civicrm($entity);
+    }
 }
 
 /**
@@ -15,9 +21,15 @@ function ozk_profielfoto_entity_insert($entity, $type) {
  * Vervangt de Rule: "Entityform Profielfoto Update"
  */
 function ozk_profielfoto_entity_update($entity, $type) {
-	if ($type === 'entityform' && $entity->type === 'profielfoto') {
-		_ozk_profielfoto_sync_profielfoto_naar_civicrm($entity);
-	}
+    if ($type === 'entityform' && $entity->type === 'profielfoto') {
+        if (!defined('OZK_PROFIELFOTO_AUTOCROP_ALTIJD')) {
+            define('OZK_PROFIELFOTO_AUTOCROP_ALTIJD', TRUE);
+        }
+        if (OZK_PROFIELFOTO_AUTOCROP_ALTIJD || _ozk_profielfoto_is_mobiel()) {
+            _ozk_profielfoto_autocrop_op_gezicht($entity);
+        }
+        _ozk_profielfoto_sync_profielfoto_naar_civicrm($entity);
+    }
 }
 
 /**
@@ -33,6 +45,23 @@ function ozk_profielfoto_form_alter(&$form, &$form_state, $form_id) {
 
             $form['actions']['submit']['#submit'][] = '_ozk_profielfoto_profielfoto_redirect_force';
 
+            // Schakelaar: TRUE = autocrop altijd server-side (manualcrop verborgen).
+            //             FALSE = manualcrop zichtbaar voor desktop, autocrop alleen op mobiel.
+            define('OZK_PROFIELFOTO_AUTOCROP_ALTIJD', TRUE);
+
+            if (OZK_PROFIELFOTO_AUTOCROP_ALTIJD) {
+                // Verberg de manualcrop-thumblist volledig via CSS en onderdruk de validatie.
+                $form['#validate'][]    = '_ozk_profielfoto_crop_fout_vertalen';
+                drupal_add_css(
+                    '.manualcrop-thumblist, .ozk-crop-hint { display:none !important; }',
+                    ['type' => 'inline', 'group' => CSS_THEME, 'weight' => 99]
+                );
+            } else {
+                // Toon bijsnijden-UI met uitleg + vriendelijke foutmelding.
+                $form['#validate'][]    = '_ozk_profielfoto_crop_fout_vertalen';
+                $form['#after_build'][] = '_ozk_profielfoto_crop_uitleg_toevoegen';
+            }
+
             // HEIC/HEIF accepteren: hang onze converter vooraan de upload-validators
             // van het fotoveld. Dit MOET hier (in form_alter, vóór form_builder),
             // omdat managed_file de upload afhandelt in zijn #value_callback en niet
@@ -41,6 +70,268 @@ function ozk_profielfoto_form_alter(&$form, &$form_state, $form_id) {
                 _ozk_profielfoto_heic_validator_inhaken($form['field_profielfoto']);
             }
         }
+    }
+}
+
+/**
+ * =======================================================================================
+ * VALIDATE: _ozk_profielfoto_crop_fout_vertalen
+ * =======================================================================================
+ * Vervangt de technische manualcrop-validatiefout ("must have a cropping selection")
+ * door een vriendelijke Nederlandse melding die de gebruiker uitlegt wat te doen.
+ */
+function _ozk_profielfoto_crop_fout_vertalen($form, &$form_state) {
+    $fouten = form_get_errors();
+    if (empty($fouten)) {
+        return;
+    }
+
+    $bevat_crop_fout = FALSE;
+    foreach ($fouten as $fout) {
+        if (strpos($fout, 'must have a cropping selection') !== FALSE
+            || strpos($fout, 'cropping selection') !== FALSE) {
+            $bevat_crop_fout = TRUE;
+            break;
+        }
+    }
+    if (!$bevat_crop_fout) {
+        return;
+    }
+
+    // Wis alle fouten en zet ze terug — met de crop-fout vervangen of onderdrukt.
+    form_clear_error();
+    $is_mobiel = _ozk_profielfoto_is_mobiel();
+
+    // Drain ook de al-ge-queude sessie-berichten zodat de fout niet meer zichtbaar is.
+    $sessie_fouten = drupal_get_messages('error', TRUE);
+    $crop_patroon  = 'cropping selection';
+
+    foreach ($fouten as $veld => $fout) {
+        if (strpos($fout, $crop_patroon) !== FALSE) {
+            if (!$is_mobiel) {
+                form_set_error($veld, t('Foto nog niet bijgesneden — klik op de knop <strong>Bijsnijden</strong> onder de foto, sleep een vierkant gebied, en klik daarna op <strong>Opslaan</strong>.'));
+            }
+            // Op mobiel: stil weggooien, autocrop doet het server-side.
+        } else {
+            form_set_error($veld, $fout);
+        }
+    }
+
+    // Zet sessie-foutberichten terug zonder de crop-meldingen.
+    if (!empty($sessie_fouten['error'])) {
+        foreach ($sessie_fouten['error'] as $bericht) {
+            if (strpos($bericht, $crop_patroon) === FALSE) {
+                drupal_set_message($bericht, 'error');
+            }
+        }
+    }
+}
+
+/**
+ * =======================================================================================
+ * AFTER_BUILD: _ozk_profielfoto_crop_uitleg_toevoegen
+ * =======================================================================================
+ * Injecteert via inline JS een korte uitleg naast de bijsnijden-thumbnail, zodat de
+ * gebruiker weet dat klikken op de miniatuur de cropper opent.
+ */
+function _ozk_profielfoto_crop_uitleg_toevoegen($form, &$form_state) {
+    $js = <<<'JS'
+(function ($) {
+  Drupal.behaviors.ozkCropUitleg = {
+    attach: function (context, settings) {
+      // Voeg uitleg toe naast elke bijsnijden-thumbnail (eenmalig via .once()).
+      $('.manualcrop-thumblist', context).once('ozk-crop-uitleg', function () {
+        $(this).after(
+          '<p class="ozk-crop-hint" style="margin-top:4px;font-size:0.9em;color:#555;">' +
+          '<strong>Klik op het plaatje hierboven</strong> om de foto bij te snijden. ' +
+          'Sleep daarna een vierkant gebied en klik op <em>Opslaan</em>.' +
+          '</p>' +
+          '<p class="ozk-crop-hint ozk-crop-hint--mobiel" style="margin-top:2px;font-size:0.85em;color:#888;">' +
+          '&#128196; Tip: bijsnijden werkt het makkelijkst op een laptop of pc. Op een telefoon kan het wat lastiger zijn.' +
+          '</p>'
+        );
+      });
+    }
+  };
+}(jQuery));
+JS;
+    drupal_add_js($js, ['type' => 'inline', 'scope' => 'footer', 'weight' => 10]);
+    return $form;
+}
+
+/**
+ * =======================================================================================
+ * HELPER: _ozk_profielfoto_is_mobiel
+ * =======================================================================================
+ * Geeft TRUE als het huidige verzoek van een mobiel apparaat komt (telefoon of tablet).
+ * Gebruikt de User-Agent — voldoende nauwkeurig voor de crop-beslissing.
+ */
+function _ozk_profielfoto_is_mobiel() {
+    $ua = isset($_SERVER['HTTP_USER_AGENT']) ? $_SERVER['HTTP_USER_AGENT'] : '';
+    return (bool) preg_match(
+        '/Android|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobile|Tablet/i',
+        $ua
+    );
+}
+
+/**
+ * =======================================================================================
+ * HELPER: _ozk_profielfoto_autocrop_op_gezicht
+ * =======================================================================================
+ * Roept ozk-facedetect aan op de geüploade foto. Als er een gezicht gevonden wordt,
+ * snijdt ImageMagick de foto vierkant bij rondom het gezicht (met padding voor hoofd +
+ * schouders). Zo hoeft een mobiele gebruiker niet zelf te croppen via de cropper.
+ *
+ * Het bestand wordt IN PLACE overschreven: het fid blijft hetzelfde, alleen de
+ * bestandsinhoud en afmetingen veranderen.
+ */
+function _ozk_profielfoto_autocrop_op_gezicht($entity) {
+    $extdebug = 'ozk_profielfoto';
+    $t_start  = microtime(TRUE);
+
+    $veld = field_get_items('entityform', $entity, 'field_profielfoto');
+    if (empty($veld[0]['fid'])) {
+        return;
+    }
+
+    $bestand = file_load($veld[0]['fid']);
+    if (!$bestand) {
+        return;
+    }
+
+    $pad = drupal_realpath($bestand->uri);
+    if (!$pad || !is_file($pad)) {
+        watchdog($extdebug, 'autocrop: bestand niet gevonden op schijf: @uri', ['@uri' => $bestand->uri], WATCHDOG_WARNING);
+        return;
+    }
+
+    // ------------------------------------------------------------------ 1. Gezicht detecteren
+    // Verkleinde werkkopie voor snellere detectie (dlib schaal O(n²) mee met pixels).
+    $script       = dirname(__FILE__) . '/bin/ozk-facedetect';
+    $tmp_detect   = $pad . '.detect.jpg';
+    $img_info_pre = getimagesize($pad);
+    $schaal       = 1.0;
+    $t_pre        = microtime(TRUE);
+    if ($img_info_pre && max($img_info_pre[0], $img_info_pre[1]) > 800) {
+        exec('magick ' . escapeshellarg($pad . '[0]') . " -resize '800x800>' " . escapeshellarg($tmp_detect));
+        $tmp_info = getimagesize($tmp_detect);
+        if ($tmp_info) {
+            $schaal = $img_info_pre[0] / $tmp_info[0];
+        }
+        $detect_pad = $tmp_detect;
+    } else {
+        $detect_pad = $pad;
+    }
+    $t_preshrink = microtime(TRUE);
+    watchdog($extdebug, 'TIMING pre-shrink: @ms ms (orig @bx@h → detectie op @dp)',
+        ['@ms' => round(($t_preshrink - $t_pre) * 1000), '@b' => $img_info_pre[0] ?? '?',
+         '@h' => $img_info_pre[1] ?? '?', '@dp' => basename($detect_pad)], WATCHDOG_DEBUG);
+
+    $cmd_detect = escapeshellarg($script) . ' ' . escapeshellarg($detect_pad);
+    $json_raw   = shell_exec($cmd_detect);
+    $t_detect   = microtime(TRUE);
+    watchdog($extdebug, 'TIMING facedetect: @ms ms', ['@ms' => round(($t_detect - $t_preshrink) * 1000)], WATCHDOG_DEBUG);
+
+    if (isset($tmp_detect) && file_exists($tmp_detect)) {
+        @unlink($tmp_detect);
+    }
+    $gezicht_raw = $json_raw ? json_decode($json_raw, TRUE) : NULL;
+    // Coördinaten terugschalen naar originele afmetingen
+    $gezicht = $gezicht_raw;
+    if (!empty($gezicht_raw['found']) && $schaal > 1.0) {
+        $gezicht = [
+            'found'  => TRUE,
+            'top'    => (int) round($gezicht_raw['top']    * $schaal),
+            'right'  => (int) round($gezicht_raw['right']  * $schaal),
+            'bottom' => (int) round($gezicht_raw['bottom'] * $schaal),
+            'left'   => (int) round($gezicht_raw['left']   * $schaal),
+        ];
+    }
+
+    if (empty($gezicht['found'])) {
+        // Geen gezicht gevonden → val terug op gecentreerde vierkante crop (entropy-vrij).
+        watchdog($extdebug, 'autocrop: geen gezicht gevonden in @f, val terug op midden-crop.', ['@f' => $bestand->filename], WATCHDOG_INFO);
+        _ozk_profielfoto_autocrop_midden($pad);
+        return;
+    }
+
+    watchdog($extdebug, 'autocrop: gezicht gevonden top=@t right=@r bottom=@b left=@l in @f', [
+        '@t' => $gezicht['top'], '@r' => $gezicht['right'],
+        '@b' => $gezicht['bottom'], '@l' => $gezicht['left'],
+        '@f' => $bestand->filename,
+    ], WATCHDOG_INFO);
+
+    // ------------------------------------------------------------------ 2. Afmetingen origineel
+    $img_info = getimagesize($pad);
+    if (!$img_info) {
+        watchdog($extdebug, 'autocrop: getimagesize mislukt voor @f', ['@f' => $pad], WATCHDOG_WARNING);
+        return;
+    }
+    $img_breed  = $img_info[0];
+    $img_hoogte = $img_info[1];
+
+    // ------------------------------------------------------------------ 3. Vierkant rondom gezicht berekenen
+    $gz_top    = $gezicht['top'];
+    $gz_right  = $gezicht['right'];
+    $gz_bottom = $gezicht['bottom'];
+    $gz_left   = $gezicht['left'];
+
+    $gz_breed  = $gz_right  - $gz_left;
+    $gz_hoogte = $gz_bottom - $gz_top;
+    $gz_cx     = (int) round(($gz_left + $gz_right)  / 2);
+    $gz_cy     = (int) round(($gz_top  + $gz_bottom) / 2);
+
+    // Padding: 2.5× de gezichtshoogte → ruimte voor kruin + schouders
+    $zijde = (int) round(max($gz_breed, $gz_hoogte) * 2.5);
+    $zijde = max($zijde, 100); // minimaal 100px
+
+    // Gezichtscentrum op 42% van boven zodat kruin én kin goed passen
+    $crop_top  = $gz_cy - (int) round($zijde * 0.42);
+    $crop_left = $gz_cx - (int) round($zijde / 2);
+
+    // Klem binnen de afbeeldingsgrenzen
+    $crop_left = max(0, min($crop_left, $img_breed  - $zijde));
+    $crop_top  = max(0, min($crop_top,  $img_hoogte - $zijde));
+    $zijde     = min($zijde, $img_breed, $img_hoogte);
+
+    // ------------------------------------------------------------------ 4. Crop + resize met ImageMagick
+    // Max 400×400 zodat het bestand onder de 150KB cssinliner-embed-limiet blijft.
+    $geometry = sprintf('%dx%d+%d+%d', $zijde, $zijde, $crop_left, $crop_top);
+    $cmd_crop = sprintf(
+        'magick %s -crop %s +repage -auto-orient -resize 400x400 -quality 85 %s',
+        escapeshellarg($pad . '[0]'),
+        escapeshellarg($geometry),
+        escapeshellarg($pad)
+    );
+    exec($cmd_crop, $uitvoer, $rv);
+    $t_crop = microtime(TRUE);
+    watchdog($extdebug, 'TIMING ImageMagick crop+resize: @ms ms', ['@ms' => round(($t_crop - $t_detect) * 1000)], WATCHDOG_DEBUG);
+
+    if ($rv !== 0) {
+        watchdog($extdebug, 'autocrop: ImageMagick crop mislukt (rv=@rv) voor @f', ['@rv' => $rv, '@f' => $bestand->filename], WATCHDOG_ERROR);
+        return;
+    }
+
+    // Bestandsgrootte in DB bijwerken na overschrijven
+    $bestand->filesize = filesize($pad);
+    file_save($bestand);
+
+    watchdog($extdebug, 'autocrop: crop geslaagd (@g) voor @f — totaal @ms ms',
+        ['@g' => $geometry, '@f' => $bestand->filename, '@ms' => round((microtime(TRUE) - $t_start) * 1000)], WATCHDOG_INFO);
+}
+
+/**
+ * Fallback: vierkante crop gecentreerd in de afbeelding (als ozk-facedetect geen gezicht vindt).
+ */
+function _ozk_profielfoto_autocrop_midden($pad) {
+    $cmd = sprintf(
+        'magick %s -gravity Center -extent "%%[fx:min(w,h)]x%%[fx:min(w,h)]" +repage -resize 400x400 -quality 85 %s',
+        escapeshellarg($pad . '[0]'),
+        escapeshellarg($pad)
+    );
+    exec($cmd, $uitvoer, $rv);
+    if ($rv !== 0) {
+        watchdog('ozk_profielfoto', 'autocrop_midden: ImageMagick mislukt (rv=@rv)', ['@rv' => $rv], WATCHDOG_ERROR);
     }
 }
 
@@ -176,6 +467,7 @@ function _ozk_profielfoto_profielfoto_redirect_force($form, &$form_state) {
  */
 function _ozk_profielfoto_sync_profielfoto_naar_civicrm($entity) {
 	$extdebug				= 'intake.profielfoto';
+	$t_sync_start			= microtime(TRUE);
 
 	// 1. Controleer of er een bestand is geüpload
 	$field_data				= field_get_items('entityform', $entity, 'field_profielfoto');
@@ -186,9 +478,20 @@ function _ozk_profielfoto_sync_profielfoto_naar_civicrm($entity) {
 
 	// 2. Gebruik de square_profielfoto styled URL voor CiviCRM zodat de manualcrop
 	//    selectie van de gebruiker ook in het CiviCRM-profielfoto-veld terecht komt.
-	//    De originele Drupal URI wordt meegegeven voor de mail-thumbnail generatie.
+	//    Op mobiel is de file al vierkant bijgesneden door autocrop; gebruik dan de
+	//    directe file-URL zodat er geen mislukte manualcrop-derivative wordt aangevraagd.
 	$drupal_uri             = $field_data[0]['uri'];
-	$image_url              = image_style_url('square_profielfoto', $drupal_uri);
+	if (!defined('OZK_PROFIELFOTO_AUTOCROP_ALTIJD')) {
+		define('OZK_PROFIELFOTO_AUTOCROP_ALTIJD', TRUE);
+	}
+	if (OZK_PROFIELFOTO_AUTOCROP_ALTIJD || _ozk_profielfoto_is_mobiel()) {
+		// Bestand is al vierkant bijgesneden door autocrop.
+		// Sla de directe bestandsURL op — de CiviCRM Views handler past zelf de
+		// gewenste image style toe per view display (square_0260, square_0320, etc.).
+		$image_url = file_create_url($drupal_uri);
+	} else {
+		$image_url = image_style_url('square_profielfoto', $drupal_uri);
+	}
 	_ozk_profielfoto_push_image_url_naar_civicrm($entity->uid, $image_url, $drupal_uri);
 }
 
@@ -220,19 +523,29 @@ function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url, $drupal_
 		wachthond($extdebug, 1, "### DRUPAL SYNC: PROFIELFOTO NAAR CIVICRM PUSHEN",		"[CID: $contact_id]");
 		wachthond($extdebug, 2, "########################################################################");
 
-		// 3. APIv4 Parameters opbouwen (Alleen URL, intake.php pre-hook doet de rest)
-		$params_update_foto = [
-			'checkPermissions'	=> FALSE,
-			'where'				=> [['id', '=', $contact_id]],
-			'values'			=> ['image_URL' => $image_url],
-		];
-		
-		wachthond($extdebug, 7, 'params_update_foto',			$params_update_foto);
+		wachthond($extdebug, 3, 'image_url direct SQL', $image_url);
 
 		try {
-			// 4. Push Foto URL via APIv4
-			$result_foto	= civicrm_api4('Contact', 'update', $params_update_foto);
-			wachthond($extdebug, 9, 'result_foto',					$result_foto);
+			// 3. Directe SQL voor image_URL — bypast delta/stgave/training hook-stack (~12-19s).
+			//    image_URL is geen bedrijfslogica-veld; hooks hoeven hier niet te vuren.
+			CRM_Core_DAO::executeQuery(
+				'UPDATE civicrm_contact SET image_URL = %1 WHERE id = %2',
+				[1 => [$image_url, 'String'], 2 => [$contact_id, 'Integer']]
+			);
+			wachthond($extdebug, 3, 'image_url bijgewerkt via SQL', $contact_id);
+
+			// 3b. Foto datum + status direct via SQL (base_api_wrapper → Contact.update triggert
+			//     anders de volledige hook-stack van ~20s; civicrm_value_intake_181 UPSERT).
+			// OZK_PROFIELFOTO_AUTOCROP_ALTIJD = TRUE: autocrop garandeert altijd een vierkant
+			// resultaat → direct status 2 ('vierkant') wegschrijven, geen recompute nodig.
+			$new_fot_update = date('YmdHis');
+			CRM_Core_DAO::executeQuery(
+				'INSERT INTO civicrm_value_intake_181 (entity_id, fot_update_2253, fot_status_1798)
+				 VALUES (%1, %2, 2)
+				 ON DUPLICATE KEY UPDATE fot_update_2253 = %2, fot_status_1798 = 2',
+				[1 => [$contact_id, 'Integer'], 2 => [$new_fot_update, 'String']]
+			);
+			wachthond($extdebug, 3, 'fot_update + fot_status direct SQL', $new_fot_update);
 			
 			watchdog('ozk_profielfoto', "Profielfoto URL succesvol gesynchroniseerd voor CID: $contact_id", NULL, WATCHDOG_INFO);
 
@@ -274,305 +587,65 @@ function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url, $drupal_
 			}
 			wachthond($extdebug, 3, 'ditjaar_kampnaam', $ditjaar_kampnaam);
 
-			$email_to       = 'richard.van.oosterhout@gmail.com';
-			$email_subject  = '[CRM] Profielfoto update - ' . date('Ymd_His');
-
-			// Link naar het CiviCRM-contactrecord (admin is ingelogd). Dient tevens als
-			// betrouwbare fallback: mailclients blokkeren/proxyen vaak de inline-hotlink van
-			// een externe afbeelding, dus via deze link is de foto altijd te bekijken.
-			$contact_view_url = 'https://www.onvergetelijk.nl/civicrm/contact/view?reset=1&cid=' . $contact_id;
-
-			// --- Kan de foto INLINE mee (cid) i.p.v. hotlinken? ---
-			// Voor de mail gebruiken we square_0260 (polaroid, 260×320 JPEG) als basis en
-			// renderen de voornaam er met GD over in het witte balkje onderaan.
-			// Fallback op hotlink als het lokale pad niet beschikbaar is.
-			$mimeMap   = ['jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg', 'png' => 'image/png', 'gif' => 'image/gif'];
-			$localPath = FALSE;
+			// Pre-genereer alle benodigde image-style derivatives zodat de tokens
+			// in mails direct werken zonder on-demand generatie door Drupal.
 			if ($drupal_uri) {
-				$mail_style    = 'square_0260';
-				$mail_dest_uri = image_style_path($mail_style, $drupal_uri);
-				if (!file_exists(drupal_realpath($mail_dest_uri))) {
-					$style_def = image_style_load($mail_style);
-					if ($style_def) {
-						image_style_create_derivative($style_def, $drupal_uri, $mail_dest_uri);
-					}
-				}
-				$localPath = drupal_realpath($mail_dest_uri) ?: FALSE;
-			}
-			if (!$localPath) {
-				// Fallback: leid pad af uit de $image_url.
-				$webroot   = '/var/www/vhosts/ozkprod/web';
-				$urlPath   = parse_url($image_url, PHP_URL_PATH);
-				$localPath = $webroot . urldecode((string) $urlPath);
-			}
-			$ext      = strtolower(pathinfo($localPath, PATHINFO_EXTENSION));
-			// Geen bestanden > 2 MB inline sturen (voorkomt lege base64 bij geheugentekort).
-			$filesize = is_file($localPath) ? filesize($localPath) : 0;
-			$canEmbed = isset($mimeMap[$ext]) && is_file($localPath) && is_readable($localPath) && $filesize > 0 && $filesize < 2 * 1024 * 1024;
-
-			// Render voornaam op de polaroid in het witte balkje (GD + Rambla-Bold).
-			// Polaroid is 260×320: witte balk onderaan ~74px hoog, centrum op y≈283.
-			// Geen entity-context in deze codepath → naam uit $display_name afleiden.
-			$imgBytes    = NULL;
-			$imgMimeType = $canEmbed ? $mimeMap[$ext] : NULL;
-			$imgFilename = $canEmbed ? basename($localPath) : NULL;
-			if ($canEmbed && function_exists('imagecreatefromstring') && function_exists('imagettftext')) {
-				$rawBytes = file_get_contents($localPath);
-				if ($rawBytes !== FALSE) {
-					$gdImg = @imagecreatefromstring($rawBytes);
-					if ($gdImg !== FALSE) {
-						// Voornaam = eerste woord van display_name
-						$voornaam  = explode(' ', trim($display_name))[0];
-						$font      = '/var/www/vhosts/ozkprod/web/sites/default/files/ozkcontent/Rambla-Bold.ttf';
-						$fontsize  = 18;
-						$color     = imagecolorallocate($gdImg, 51, 51, 51);
-						$imgW      = imagesx($gdImg);
-						$imgH      = imagesy($gdImg);
-						// Bereken tekstbreedte voor horizontale centrering
-						$bbox      = imagettfbbox($fontsize, 0, $font, $voornaam);
-						$textW     = abs($bbox[2] - $bbox[0]);
-						$xText     = (int)(($imgW - $textW) / 2);
-						// Baseline op centrum witte balk (283px van boven in 320px hoge afbeelding)
-						$yText     = (int)($imgH * 0.885);
-						imagettftext($gdImg, $fontsize, 0, $xText, $yText, $color, $font, $voornaam);
-						ob_start();
-						imagejpeg($gdImg, NULL, 85);
-						$jpegBytes = ob_get_clean();
-						imagedestroy($gdImg);
-						if ($jpegBytes !== FALSE && strlen($jpegBytes) > 0) {
-							$imgBytes    = $jpegBytes;
-							$imgMimeType = 'image/jpeg';
-							$imgFilename = preg_replace('/\.\w+$/', '.jpg', $imgFilename);
-							// Wegschrijven naar square_0260_naam derivative-pad zodat de URL
-							// direct opvraagbaar is (view hoeft pipeline niet te draaien).
-							if ($drupal_uri) {
-								$naam_dest_uri = image_style_path('square_0260_naam', $drupal_uri);
-								$naam_dir_uri  = 'public://styles/square_0260_naam/public/' . dirname(str_replace('public://', '', $drupal_uri));
-								file_prepare_directory($naam_dir_uri, FILE_CREATE_DIRECTORY);
-								$naam_local = str_replace(
-									'public://',
-									'/var/www/vhosts/ozkprod/web/sites/default/files/',
-									$naam_dest_uri
-								);
-								file_put_contents($naam_local, $jpegBytes);
-							}
-						}
+				foreach (['square_profielfoto', 'square_0260', 'square_0260_naam'] as $_style_name) {
+					$_style_def = image_style_load($_style_name);
+					if (!$_style_def) continue;
+					$_style_uri = image_style_path($_style_name, $drupal_uri);
+					if (!file_exists(drupal_realpath($_style_uri))) {
+						image_style_create_derivative($_style_def, $drupal_uri, $_style_uri);
+						wachthond($extdebug, 3, 'derivative aangemaakt', $_style_name);
 					}
 				}
 			}
-			if ($canEmbed && $imgBytes === NULL) {
-				// GD-rendering mislukt: stuur derivative onbewerkt.
-				$imgBytes = file_get_contents($localPath) ?: NULL;
-			}
-			$canEmbed = $canEmbed && ($imgBytes !== NULL);
 
-			// Laad ook square_profielfoto als tweede inline afbeelding (kleine foto boven).
-			$squareBytes    = NULL;
-			$squareMimeType = NULL;
-			$squareFilename = NULL;
-			if ($drupal_uri) {
-				$sq_uri   = image_style_path('square_profielfoto', $drupal_uri);
-				if (!file_exists(drupal_realpath($sq_uri))) {
-					$sq_def = image_style_load('square_profielfoto');
-					if ($sq_def) {
-						image_style_create_derivative($sq_def, $drupal_uri, $sq_uri);
-					}
-				}
-				$sq_local = drupal_realpath($sq_uri) ?: FALSE;
-				if ($sq_local && is_file($sq_local) && filesize($sq_local) > 0 && filesize($sq_local) < 2 * 1024 * 1024) {
-					$squareBytes    = file_get_contents($sq_local) ?: NULL;
-					$squareMimeType = 'image/jpeg';
-					$squareFilename = basename($sq_local);
-				}
-			}
+			// Bereken square_0260 URL voor de polaroid in de mail.
+			$sq0260_url = $drupal_uri ? image_style_url('square_0260', $drupal_uri) : $image_url;
 
-			// Render template 608 via CiviCRM en embed afbeeldingen inline (cid:).
-			// Template params gespiegeld aan de normale send-aanroep.
 			$tpl_params = [
-				'fotoedit'   => 'https://www.onvergetelijk.nl/profielfoto',
-				'fotolink'   => $image_url,
-				'ozkweburl'  => 'https://www.onvergetelijk.nl',
-				'user_cid'   => $contact_id,
+				'fotoedit'      => 'https://www.onvergetelijk.nl/profielfoto',
+				'fotolink'      => $sq0260_url,
+				'user_kamplang' => $ditjaar_kampnaam ?: $ditjaar_kampkort ?: 'je kamp',
+				'ozkweburl'     => 'https://www.onvergetelijk.nl',
+				'user_cid'      => $contact_id,
 			];
+
+			wachthond($extdebug, 3, 'TIMING sync tot e-mail: ' . round((microtime(TRUE) - $t_sync_start) * 1000) . ' ms', '');
+
+			// Beheerder-notificatie (zelfde template, apart onderwerp).
+			$t_mail1 = microtime(TRUE);
 			try {
-				$tpl_result  = \CRM_Core_BAO_MessageTemplate::renderTemplate([
+				\CRM_Core_BAO_MessageTemplate::sendTemplate([
 					'messageTemplateID' => 608,
 					'contactId'         => $contact_id,
+					'toEmail'           => 'richard.van.oosterhout@gmail.com',
+					'toName'            => 'Webteam OZK',
+					'from'              => 'OZK <info@onvergetelijk.nl>',
+					'subject'           => '[CRM] Profielfoto update - ' . date('Ymd_His'),
 					'tplParams'         => $tpl_params,
 				]);
-				$tpl_html    = $tpl_result['html']    ?? NULL;
-				$tpl_subject = $tpl_result['subject']  ?? NULL;
-			} catch (\Throwable $renderEx) {
-				// Fallback: stel eigen minimale HTML in als render mislukt.
-				$tpl_html    = NULL;
-				$tpl_subject = $email_subject;
-				wachthond($extdebug, 1, 'Template 608 render mislukt', $renderEx->getMessage());
+				wachthond($extdebug, 3, "TIMING mail beheerder: " . round((microtime(TRUE) - $t_mail1) * 1000) . " ms", "[CRM]");
+				wachthond($extdebug, 3, "E-mail notificatie verzonden naar beheerder", "[CRM]");
+			} catch (\Throwable $sendEx) {
+				wachthond($extdebug, 1, "sendTemplate beheerder mislukt", $sendEx->getMessage());
 			}
 
-			// Bouw de inline-embedded versie van de gerenderde HTML.
-			// Vervang de externe img src's door cid:-referenties.
-			$inlineImages = [];  // ['cid' => ..., 'mime' => ..., 'filename' => ..., 'bytes' => ...]
-
-			if ($tpl_html) {
-				// Verwijder de hele bovenste foto-rij (td class="fotocel" met de square_profielfoto) —
-				// notificatiemail toont alleen de polaroid. De fotocel reserveert 128px hoogte, dus de
-				// <img> alleen weghalen laat een leeg vak staan: de complete <tr> moet weg.
-				$tpl_html = preg_replace(
-					'/<tr>\s*<td\b[^>]*class="fotocel"[^>]*>.*?<\/td>\s*<\/tr>/s',
-					'',
-					$tpl_html
-				);
-				// Vangnet: losse <a><img class="profielfoto"></a> zonder fotocel-wrapper.
-				$tpl_html = preg_replace(
-					'/<a\b[^>]*>\s*<img\b[^>]*class="profielfoto"[^>]*>\s*<\/a>/s',
-					'',
-					$tpl_html
-				);
-				// Verwijder de smoelenboek-disclaimer — niet relevant in een beheerder/hoofdleiding-mail.
-				$tpl_html = preg_replace(
-					'/<tr>\s*<td\b[^>]*>\s*<small>\(Deze foto wordt vierkant.*?<\/small>\s*<\/td>\s*<\/tr>/s',
-					'',
-					$tpl_html
-				);
-				// Fallback: ook een eventuele contact/view-link weghalen.
-				$tpl_html = preg_replace(
-					'/<a\b[^>]*civicrm\/contact\/view[^>]*>.*?<\/a>/s',
-					'',
-					$tpl_html
-				);
-
-				// Maak displaynaam klikbaar naar CiviCRM contactrecord.
-				$tpl_html = str_replace(
-					htmlspecialchars($display_name),
-					'<a href="' . $contact_view_url . '" style="color:#c13c62;text-decoration:underline;">'
-						. htmlspecialchars($display_name) . '</a>',
-					$tpl_html
-				);
-				// square_0260_naam polaroid inline (cid:polaroid)
-				wachthond($extdebug, 3, 'notificatie: canEmbed / imgBytes-len',
-					[$canEmbed ? 'JA' : 'NEE', is_string($imgBytes) ? strlen($imgBytes) : gettype($imgBytes)]);
-				if ($canEmbed) {
-					$inlineImages[] = [
-						'cid'      => 'polaroid',
-						'mime'     => $imgMimeType,
-						'filename' => $imgFilename,
-						'bytes'    => $imgBytes,
-					];
-					$tpl_html = preg_replace(
-						'/src="https?:[^"]*square_0260[^"]*"/',
-						'src="cid:polaroid"',
-						$tpl_html
-					);
-				}
-				// cursor:default op alle foto-imgs
-				$tpl_html = preg_replace(
-					'/(<img\b[^>]*(?:cid:squarefoto|cid:polaroid)[^>]*)(style=")/',
-					'$1$2cursor:default;',
-					$tpl_html
-				);
-				// OZK-logo: begrens breedte zodat 1920px banner niet de volledige mail vult.
-				$tpl_html = preg_replace(
-					'/(OZK_banner[^"]*"[^>]*)\/>/',
-					'$1 style="display:block;width:360px;max-width:100%;height:auto;" />',
-					$tpl_html
-				);
-				// Vervang de parent-gerichte "Als u wilt kunt u de gegevens…"-regel door een
-				// whitesmoke divbtn naar de CiviCRM-contactkaart (beheerder/hoofdleiding-mail).
-				$gegevens_btn =
-					'<div style="padding:10px 20px;margin:8px 0;text-align:center;cursor:pointer;'
-					. 'background-color:whitesmoke;border:1px solid #ddd;">'
-					. '<a href="' . $contact_view_url . '" rel="noopener" target="_blank"'
-					. ' style="color:inherit;text-decoration:none;">» Gegevens '
-					. htmlspecialchars($display_name) . '</a></div>';
-				$tpl_html = preg_replace(
-					'/<p>\s*<small>\s*Als u wilt kunt u de gegevens.*?<\/small>\s*<\/p>/s',
-					$gegevens_btn,
-					$tpl_html,
-					1,
-					$count_btn
-				);
-				// Vangnet: als de regel niet voorkwam, hang de knop vóór </body>.
-				if (empty($count_btn)) {
-					$tpl_html = preg_replace('/<\/body>/', $gegevens_btn . '</body>', $tpl_html, 1);
-				}
+			// Indiener-bevestiging (zelfde template, naar primair e-mailadres van de contact).
+			$t_mail2 = microtime(TRUE);
+			try {
+				\CRM_Core_BAO_MessageTemplate::sendTemplate([
+					'messageTemplateID' => 608,
+					'contactId'         => $contact_id,
+					'from'              => 'OZK <info@onvergetelijk.nl>',
+					'tplParams'         => $tpl_params,
+				]);
+				wachthond($extdebug, 3, "TIMING mail indiener: " . round((microtime(TRUE) - $t_mail2) * 1000) . " ms", $contact_id);
+				wachthond($extdebug, 3, "E-mail bevestiging verzonden naar indiener CID", $contact_id);
+			} catch (\Throwable $sendEx) {
+				wachthond($extdebug, 1, "sendTemplate indiener mislukt", $sendEx->getMessage());
 			}
-
-			$email_bericht = $tpl_html ?: (
-				// Minimale fallback als render volledig mislukte
-				'<html><body><p>' . htmlspecialchars($display_name) . '</p>'
-				. '<img src="' . $image_url . '" width="128">'
-				. '</body></html>'
-			);
-
-			// Toon in de beheerder-notificatie welk kamp én welke functie de foto betreft.
-			// kampkort komt uit base_find_allpart; kampfunctie werd voorheen wél opgehaald
-			// (regel ~257) maar nergens getoond — nu zichtbaar zodat de beheerder context heeft.
-			if ($ditjaar_kampkort || $ditjaar_kampfunctie) {
-				$kampinfo_parts = array_filter([$ditjaar_kampkort, $ditjaar_kampfunctie]);
-				$kampinfo_html  = '<p style="margin:8px 0;color:#555;">Kamp: '
-								. htmlspecialchars(implode(' — ', $kampinfo_parts)) . '</p>';
-				if (stripos($email_bericht, '</body>') !== FALSE) {
-					$email_bericht = preg_replace('/<\/body>/i', $kampinfo_html . '</body>', $email_bericht, 1);
-				} else {
-					$email_bericht .= $kampinfo_html;
-				}
-			}
-
-			if ($inlineImages) {
-				// multipart/related: HTML + inline afbeeldingen
-				$boundary = 'ozkfoto_' . md5(uniqid('', TRUE));
-
-				$email_headers  = "MIME-Version: 1.0" . "\r\n";
-				$email_headers .= "From: noreply@onvergetelijk.nl" . "\r\n";
-				$email_headers .= "Content-Type: multipart/related; boundary=\"$boundary\"" . "\r\n";
-
-				// HTML-part als base64 coderen: de cssinliner-output is één zeer lange regel
-				// (ver boven RFC-limiet 998 tekens). Met 8bit breekt de MTA die regel, wat de
-				// MIME-boundary-parsing verschuift en de daaropvolgende base64-bijlage dropt.
-				$body  = "--$boundary\r\n";
-				$body .= "Content-Type: text/html; charset=UTF-8\r\n";
-				$body .= "Content-Transfer-Encoding: base64\r\n\r\n";
-				$body .= chunk_split(base64_encode($email_bericht)) . "\r\n";
-
-				foreach ($inlineImages as $img) {
-					$body .= "--$boundary\r\n";
-					$body .= "Content-Type: {$img['mime']}; name=\"{$img['filename']}\"\r\n";
-					$body .= "Content-Transfer-Encoding: base64\r\n";
-					$body .= "Content-ID: <{$img['cid']}>\r\n";
-					$body .= "Content-Disposition: inline; filename=\"{$img['filename']}\"\r\n\r\n";
-					$body .= chunk_split(base64_encode($img['bytes'])) . "\r\n";
-				}
-
-				$body .= "--$boundary--";
-
-				wachthond($extdebug, 3, 'notificatie: body-len vlak voor verzenden', strlen($body));
-				_ozk_profielfoto_mail($email_to, $email_subject, $body, $email_headers);
-			}
-			else {
-				// Fallback: enkelvoudige HTML zonder inline afbeeldingen
-				$email_headers  = "MIME-Version: 1.0" . "\r\n";
-				$email_headers .= "Content-Type: text/html; charset=UTF-8" . "\r\n";
-				$email_headers .= "From: noreply@onvergetelijk.nl" . "\r\n";
-
-				_ozk_profielfoto_mail($email_to, $email_subject, $email_bericht, $email_headers);
-			}
-
-			wachthond($extdebug, 3, "E-mail notificatie verzonden naar",	$email_to);
-
-			// Stuur ook bevestigingsmail naar de indiener zelf.
-			_ozk_profielfoto_mail_indiener(
-				$contact_id,
-				$display_name,
-				$ditjaar_kampkort,
-				$ditjaar_kampnaam  ?? NULL,
-				$squareBytes,
-				$squareMimeType,
-				$squareFilename,
-				$imgBytes,
-				$imgMimeType,
-				$imgFilename
-			);
-			wachthond($extdebug, 3, "E-mail bevestiging verzonden naar indiener CID", $contact_id);
 
 		} catch (\Exception $e) {
 			$error_msg			= $e->getMessage();
@@ -584,163 +657,4 @@ function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url, $drupal_
 	}
 }
 
-/**
- * Stuurt een bevestigingsmail naar de indiener (de contactpersoon zelf) na het
- * uploaden van een profielfoto. Layout analoog aan template 608, met logo en
- * beide foto's (pasfoto + polaroid) als inline base64-afbeeldingen.
- */
-function _ozk_profielfoto_mail_indiener(
-	int    $contact_id,
-	string $display_name,
-	?string $ditjaar_kampkort,
-	?string $ditjaar_kampnaam,
-	?string $squareBytes,
-	?string $squareMimeType,
-	?string $squareFilename,
-	?string $imgBytes,
-	?string $imgMimeType,
-	?string $imgFilename
-): void {
-	// Haal primair e-mailadres en voornaam op.
-	$params_email = [
-		'checkPermissions' => FALSE,
-		'select'           => ['email_primary.email', 'first_name'],
-		'where'            => [['id', '=', $contact_id]],
-	];
-	$result_email  = civicrm_api4('Contact', 'get', $params_email);
-	$contact_row   = $result_email->first();
-	$to_email      = $contact_row['email_primary.email'] ?? NULL;
-	$voornaam      = $contact_row['first_name'] ?? explode(' ', trim($display_name))[0];
 
-	if (!$to_email) {
-		wachthond('ozk_profielfoto', 1, 'indiener-mail: geen e-mailadres voor CID', $contact_id);
-		return;
-	}
-
-	// Kamplang = event-titel als die beschikbaar is, anders kampkort.
-	$kamplang = $ditjaar_kampnaam ?: $ditjaar_kampkort ?: 'je kamp';
-
-	$ozk_url  = 'https://www.onvergetelijk.nl';
-
-	// Genereer een CiviCRM-checksum inloglink naar /form/inloglink.
-	// Fallback op /account als de checksum niet gegenereerd kan worden.
-	$login_url = $ozk_url . '/account';
-	$checksum = \CRM_Contact_BAO_Contact_Utils::generateChecksum($contact_id);
-	if ($checksum) {
-		$login_url = $ozk_url . '/form/inloglink?cid1=' . $contact_id . '&cs=' . $checksum;
-	}
-	$fotoedit = $login_url;
-
-	// Laad square_0260 polaroid als CID inline — betrouwbaarder dan externe URL
-	// (Gmail-cache kan externe URLs jarenlang als broken tonen na één mislukte fetch).
-	$polaroidBytes = NULL; $polaroidMime = 'image/jpeg'; $polaroidFilename = NULL;
-	if ($imgFilename) {
-		$drupal_uri_orig = 'public://profielfotos/' . $imgFilename;
-		$pol_uri = image_style_path('square_0260', $drupal_uri_orig);
-		$pol_realpath = drupal_realpath($pol_uri);
-		wachthond('ozk_profielfoto', 3, 'indiener: polaroid uri/realpath', [$pol_uri, $pol_realpath]);
-		if (!file_exists($pol_realpath)) {
-			$pol_def = image_style_load('square_0260');
-			if ($pol_def) { image_style_create_derivative($pol_def, $drupal_uri_orig, $pol_uri); }
-		}
-		$pol_local = $pol_realpath ?: FALSE;
-		if ($pol_local && is_file($pol_local) && filesize($pol_local) > 0) {
-			$rawPol           = file_get_contents($pol_local);
-			$polaroidBytes    = ($rawPol !== FALSE && strlen($rawPol) > 0) ? $rawPol : NULL;
-			$polaroidFilename = basename($pol_local);
-			wachthond('ozk_profielfoto', 3, 'indiener: polaroidBytes geladen', strlen($rawPol ?: '') . ' bytes');
-		} else {
-			wachthond('ozk_profielfoto', 1, 'indiener: polaroid bestand niet leesbaar', $pol_local);
-		}
-	} else {
-		wachthond('ozk_profielfoto', 1, 'indiener: imgFilename leeg, geen polaroid', $contact_id);
-	}
-
-	// OZK-logo als CID inline (360px breed, PNG).
-	$logo_path = '/var/www/vhosts/ozkprod/web/sites/default/files/ozkimages/huisstijl/OZK_banner_slogan_1920.png';
-	$logoBytes = is_file($logo_path) ? (file_get_contents($logo_path) ?: NULL) : NULL;
-	wachthond('ozk_profielfoto', 3, 'indiener: logoBytes', $logoBytes ? strlen($logoBytes) . ' bytes' : 'NULL');
-
-	$polarSrc = $polaroidBytes ? 'cid:polaroid' : $fotoedit;
-	$logoSrc  = $logoBytes    ? 'cid:sitelogo'  : ($ozk_url . '/sites/default/files/ozkimages/huisstijl/OZK_banner_slogan_1920.png');
-
-	// HTML opbouwen: polaroid met naam centraal, caption eronder, dan footer.
-	$html =
-		'<!DOCTYPE html><html lang="nl"><head><meta charset="utf-8">'
-		. '<meta name="viewport" content="width=device-width,initial-scale=1.0"></head>'
-		. '<body style="margin:0;padding:0;font-family:Arial,sans-serif;">'
-		. '<p style="margin-bottom:15px;line-height:1.4;margin-top:0;">Hallo ' . htmlspecialchars($voornaam) . ',</p>'
-		. '<p style="margin-top:0;margin-bottom:15px;line-height:1.4;">'
-		. 'De pasfoto van ' . htmlspecialchars($display_name) . ' voor ' . htmlspecialchars($kamplang) . ' is bijgewerkt.'
-		. '</p>'
-		// Polaroid met naam
-		. '<table style="border-collapse:collapse;margin-top:15px;margin-bottom:8px;">'
-		. '<tbody><tr><td style="padding:0;">'
-		. '<img src="' . $polarSrc . '" width="200" alt="Polaroid ' . htmlspecialchars($voornaam) . '"'
-		. ' style="display:block;pointer-events:none;cursor:default;"></td></tr>'
-		. '<tr><td style="padding:5px 0;"><small>(Deze foto wordt vierkant weergegeven in het smoelenboek.'
-		. ' Upload een <a href="' . $fotoedit . '" style="color:#c13c62;">nieuwe foto</a>'
-		. ' of snij hem online bij indien nodig.)</small></td></tr></tbody></table>'
-		// Footer: OZK-logo
-		. '<div style="display:block;margin:0;padding:0;">'
-		. '<a href="' . $ozk_url . '" style="color:#c13c62;text-decoration:underline;pointer-events:none;cursor:default;">'
-		. '<img src="' . $logoSrc . '" alt="Stichting Onvergetelijke Zomerkampen"'
-		. ' style="display:block;width:360px;max-width:100%;height:auto;"></a></div>'
-		// Inloglink als divbtn whitesmoke
-		. '<div style="padding:10px 20px;margin:8px 0;text-align:center;cursor:pointer;'
-		. 'background-color:whitesmoke;border:1px solid #ddd;">'
-		. '<a href="' . $login_url . '" rel="noopener" target="_blank"'
-		. ' style="color:inherit;text-decoration:none;">» Inloggen op Mijn OZK</a></div>'
-		. '</body></html>';
-
-	// Verzenden als multipart/related met inline afbeeldingen.
-	// squarefoto wordt niet meer getoond in de indiener-mail.
-	$subject = 'Je pasfoto voor ' . ($ditjaar_kampkort ?? 'je kamp') . ' is bijgewerkt';
-
-	$parts = [];
-	if ($polaroidBytes) {
-		$parts[] = ['cid' => 'polaroid', 'mime' => $polaroidMime, 'filename' => $polaroidFilename, 'bytes' => $polaroidBytes];
-	}
-	if ($logoBytes) {
-		$parts[] = ['cid' => 'sitelogo', 'mime' => 'image/png', 'filename' => 'ozk_logo.png', 'bytes' => $logoBytes];
-	}
-
-	if ($parts) {
-		$boundary      = 'ozkindien_' . md5(uniqid('', TRUE));
-		$email_headers = "MIME-Version: 1.0\r\nFrom: OZK <info@onvergetelijk.nl>\r\n"
-			. "Content-Type: multipart/related; boundary=\"$boundary\"\r\n";
-		// HTML-part als base64 (zie notificatie-flow: lange regels breken anders de MIME-parsing,
-		// waardoor de inline-bijlagen door de MTA worden gedropt).
-		$body  = "--$boundary\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n"
-			. chunk_split(base64_encode($html)) . "\r\n";
-		foreach ($parts as $p) {
-			$body .= "--$boundary\r\nContent-Type: {$p['mime']}; name=\"{$p['filename']}\"\r\n"
-				. "Content-Transfer-Encoding: base64\r\nContent-ID: <{$p['cid']}>\r\n"
-				. "Content-Disposition: inline; filename=\"{$p['filename']}\"\r\n\r\n"
-				. chunk_split(base64_encode($p['bytes'])) . "\r\n";
-		}
-		$body .= "--$boundary--";
-		_ozk_profielfoto_mail($to_email, $subject, $body, $email_headers);
-	}
-	else {
-		$email_headers = "MIME-Version: 1.0\r\nFrom: OZK <info@onvergetelijk.nl>\r\n"
-			. "Content-Type: text/html; charset=UTF-8\r\n";
-		_ozk_profielfoto_mail($to_email, $subject, $html, $email_headers);
-	}
-}
-
-/**
- * Wrapper rond mail() zodat de aanroep unit-testbaar is.
- * In productie roept dit gewoon de PHP mail()-functie aan.
- * In tests wordt deze functie eerder gedefinieerd door de bootstrap-stub.
- */
-if (!function_exists('_ozk_profielfoto_mail')) {
-    function _ozk_profielfoto_mail(string $to, string $subject, string $message, string $headers = ''): bool {
-        // Normaliseer CRLF -> LF. De MTA is msmtp, die zelf LF -> CRLF maakt voor SMTP.
-        // Geven we al CRLF mee, dan wordt het \r\r\n en raakt de MIME-boundary-parsing aan
-        // de ontvangstkant (Gmail) in de war: de laatste part (inline-bijlage) valt dan weg.
-        $message = preg_replace("/\r\n|\r/", "\n", $message);
-        $headers = preg_replace("/\r\n|\r/", "\n", $headers);
-        return mail($to, $subject, $message, $headers);
-    }
-}
