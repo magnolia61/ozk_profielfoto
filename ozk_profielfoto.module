@@ -552,17 +552,18 @@ function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url, $drupal_
 			// 5. E-mail notificatie versturen (met Ymd_His timestamp)
 			// ... binnen de _ozk_profielfoto_sync_profielfoto_naar_civicrm functie ...
 
-			// Displayname ophalen via APIv4
+			// Displayname + voornaam ophalen via APIv4
 			$params_contact_naam = [
 				'checkPermissions' => FALSE,
 				'debug'            => FALSE,
-				'select'           => ['display_name'],
+				'select'           => ['display_name', 'first_name'],
 				'where'            => [['id', '=', $contact_id]],
 			];
 			wachthond($extdebug, 7, 'params_contact_naam',  $params_contact_naam);
 			$result_contact_naam = civicrm_api4('Contact', 'get', $params_contact_naam);
 			wachthond($extdebug, 9, 'result_contact_naam',  $result_contact_naam);
 			$display_name        = $result_contact_naam->first()['display_name'] ?? '(onbekend)';
+			$_voornaam           = ucwords($result_contact_naam->first()['first_name'] ?? '');
 
 			// Ditjaar kampkort en kampfunctie via base_find_allpart
 			$allpart_array       = function_exists('base_find_allpart') ? base_find_allpart($contact_id) : FALSE;
@@ -589,14 +590,37 @@ function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url, $drupal_
 
 			// Pre-genereer alle benodigde image-style derivatives zodat de tokens
 			// in mails direct werken zonder on-demand generatie door Drupal.
+			// Schaal bron eerst op naar ≥2160px zodat image_style_create_derivative
+			// niet faalt op manualcrop respectminimum (stijl verwacht bron ≥ stijlafmeting).
 			if ($drupal_uri) {
+				$_lokpad = drupal_realpath($drupal_uri);
+				$_img    = @getimagesize($_lokpad);
+				if ($_img && $_img[0] < 2160) {
+					exec('magick ' . escapeshellarg($_lokpad . '[0]') .
+						' -resize 2160x2160' .
+						' -quality 92 ' . escapeshellarg($_lokpad));
+					wachthond($extdebug, 3, 'bron opgeschaald naar 2160px tbv image_style', basename($_lokpad));
+				}
 				foreach (['square_profielfoto', 'square_0260', 'square_0260_naam'] as $_style_name) {
 					$_style_def = image_style_load($_style_name);
 					if (!$_style_def) continue;
 					$_style_uri = image_style_path($_style_name, $drupal_uri);
-					if (!file_exists(drupal_realpath($_style_uri))) {
+					$_style_dst = drupal_realpath($_style_uri);
+					@mkdir(dirname($_style_dst), 0775, TRUE);
+					if (!file_exists($_style_dst) || filesize($_style_dst) < 1000) {
 						image_style_create_derivative($_style_def, $drupal_uri, $_style_uri);
-						wachthond($extdebug, 3, 'derivative aangemaakt', $_style_name);
+						wachthond($extdebug, 3, 'derivative aangemaakt via image_style', $_style_name);
+					}
+					// Voornaam in witte balk van de polaroid — alleen voor de _naam variant.
+					// image_effects_text vereist de php-module (uitgeschakeld); wij doen het post-hoc.
+					if ($_style_name === 'square_0260_naam' && !empty($_voornaam) && file_exists($_style_dst)) {
+						$_font = DRUPAL_ROOT . '/sites/default/files/ozkcontent/Rambla-Bold.ttf';
+						exec('magick ' . escapeshellarg($_style_dst) .
+							' -font ' . escapeshellarg($_font) .
+							' -pointsize 21 -fill "#333333"' .
+							' -gravity South -annotate +0+37 ' . escapeshellarg($_voornaam) .
+							' ' . escapeshellarg($_style_dst));
+						wachthond($extdebug, 3, 'voornaam in polaroid geschreven', $_voornaam);
 					}
 				}
 			}
@@ -614,26 +638,22 @@ function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url, $drupal_
 
 			wachthond($extdebug, 3, 'TIMING sync tot e-mail: ' . round((microtime(TRUE) - $t_sync_start) * 1000) . ' ms', '');
 
-			// Beheerder-notificatie (zelfde template, apart onderwerp).
-			$t_mail1 = microtime(TRUE);
+			// Webteam-notificatie (669).
 			try {
 				\CRM_Core_BAO_MessageTemplate::sendTemplate([
-					'messageTemplateID' => 608,
+					'messageTemplateID' => 669,
 					'contactId'         => $contact_id,
-					'toEmail'           => 'richard.van.oosterhout@gmail.com',
+					'toEmail'           => 'webteam@onvergetelijk.nl',
 					'toName'            => 'Webteam OZK',
 					'from'              => 'OZK <info@onvergetelijk.nl>',
-					'subject'           => '[CRM] Profielfoto update - ' . date('Ymd_His'),
 					'tplParams'         => $tpl_params,
 				]);
-				wachthond($extdebug, 3, "TIMING mail beheerder: " . round((microtime(TRUE) - $t_mail1) * 1000) . " ms", "[CRM]");
-				wachthond($extdebug, 3, "E-mail notificatie verzonden naar beheerder", "[CRM]");
+				wachthond($extdebug, 3, "mail 669 webteam verzonden", $contact_id);
 			} catch (\Throwable $sendEx) {
-				wachthond($extdebug, 1, "sendTemplate beheerder mislukt", $sendEx->getMessage());
+				wachthond($extdebug, 1, "sendTemplate 669 webteam mislukt", $sendEx->getMessage());
 			}
 
-			// Indiener-bevestiging (zelfde template, naar primair e-mailadres van de contact).
-			$t_mail2 = microtime(TRUE);
+			// Indiener-bevestiging (608).
 			try {
 				\CRM_Core_BAO_MessageTemplate::sendTemplate([
 					'messageTemplateID' => 608,
@@ -641,10 +661,9 @@ function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url, $drupal_
 					'from'              => 'OZK <info@onvergetelijk.nl>',
 					'tplParams'         => $tpl_params,
 				]);
-				wachthond($extdebug, 3, "TIMING mail indiener: " . round((microtime(TRUE) - $t_mail2) * 1000) . " ms", $contact_id);
-				wachthond($extdebug, 3, "E-mail bevestiging verzonden naar indiener CID", $contact_id);
+				wachthond($extdebug, 3, "mail 608 indiener verzonden", $contact_id);
 			} catch (\Throwable $sendEx) {
-				wachthond($extdebug, 1, "sendTemplate indiener mislukt", $sendEx->getMessage());
+				wachthond($extdebug, 1, "sendTemplate 608 indiener mislukt", $sendEx->getMessage());
 			}
 
 		} catch (\Exception $e) {

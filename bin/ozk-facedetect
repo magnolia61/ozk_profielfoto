@@ -1,0 +1,64 @@
+#!/home/webteam/venv/facedetect/bin/python3
+"""
+ozk-facedetect  —  Geeft de bounding box van het grootste gezicht in een foto terug als JSON.
+
+Gebruik:
+    ozk-facedetect <afbeeldingspad>
+
+Uitvoer bij gezicht gevonden:
+    {"found": true, "top": 120, "right": 340, "bottom": 290, "left": 170}
+
+Uitvoer zonder gezicht:
+    {"found": false}
+
+Exitcode 0 = OK (ook als geen gezicht); exitcode 1 = fout (bestand niet gevonden etc.)
+"""
+
+import sys
+import json
+
+def main():
+    if len(sys.argv) < 2:
+        print(json.dumps({"error": "geen bestandspad opgegeven"}))
+        sys.exit(1)
+
+    pad = sys.argv[1]
+
+    try:
+        import face_recognition
+        import PIL.Image
+    except ImportError as e:
+        print(json.dumps({"error": f"module niet gevonden: {e}"}))
+        sys.exit(1)
+
+    try:
+        afbeelding = face_recognition.load_image_file(pad)
+    except Exception as e:
+        print(json.dumps({"error": f"bestand laden mislukt: {e}"}))
+        sys.exit(1)
+
+    # model="hog" = snel; model="cnn" = nauwkeuriger maar zwaarder
+    gezichten = face_recognition.face_locations(afbeelding, model="hog")
+
+    if not gezichten:
+        print(json.dumps({"found": False}))
+        sys.exit(0)
+
+    # Kies het grootste gezicht (meeste pixels)
+    def oppervlak(loc):
+        top, right, bottom, left = loc
+        return (bottom - top) * (right - left)
+
+    top, right, bottom, left = max(gezichten, key=oppervlak)
+
+    print(json.dumps({
+        "found": True,
+        "top":    top,
+        "right":  right,
+        "bottom": bottom,
+        "left":   left,
+    }))
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main()
