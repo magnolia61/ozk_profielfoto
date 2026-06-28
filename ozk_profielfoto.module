@@ -510,6 +510,10 @@ function _ozk_profielfoto_sync_profielfoto_naar_civicrm($entity) {
  */
 function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url, $drupal_uri = NULL) {
 	$extdebug				= 'intake.profielfoto';
+	// Starttijd voor de TIMING-log verderop (push → e-mail). Lokaal gezet zodat de
+	// variabele in scope is: $t_sync_start uit _ozk_profielfoto_sync_...() leeft niet
+	// in deze functie, en push is een testbare seam die ook rechtstreeks wordt aangeroepen.
+	$t_sync_start			= microtime(TRUE);
 
 	if (!civicrm_initialize()) {
 		return;
@@ -636,7 +640,7 @@ function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url, $drupal_
 				'user_cid'      => $contact_id,
 			];
 
-			wachthond($extdebug, 3, 'TIMING sync tot e-mail: ' . round((microtime(TRUE) - $t_sync_start) * 1000) . ' ms', '');
+			wachthond($extdebug, 3, 'TIMING push tot e-mail: ' . round((microtime(TRUE) - $t_sync_start) * 1000) . ' ms', '');
 
 			// Webteam-notificatie (669).
 			try {
