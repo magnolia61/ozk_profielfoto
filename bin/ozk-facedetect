@@ -1,64 +1,317 @@
 #!/home/webteam/venv/facedetect/bin/python3
 """
-ozk-facedetect  —  Geeft de bounding box van het grootste gezicht in een foto terug als JSON.
+ozk-facedetect  —  Geeft de bounding box van het beste gezicht in een foto terug als JSON.
+
+Draait MEERDERE detectoren PARALLEL en kiest de meest betrouwbare kandidaat:
+  - OpenCV YuNet (ONNX, CPU)         — robuustste all-rounder, ~10-50ms
+  - face_recognition (dlib HOG)      — goede tweede stem op frontale gezichten
+  - face_recognition (dlib CNN)      — sterk op gedraaid/scheef, maar traag (CPU)
+
+Productie draait YuNet + HOG (cascade; CNN als vangnet). De vergelijkmodus (--all)
+draait alle drie. Een detector die faalt wordt overgeslagen — de overige draaien door.
+(MediaPipe is verwijderd: het short-range model faalde op afstands-/ten-voeten-uit-
+foto's en is van de server gehaald.)
+
+Keuze van het beste gezicht:
+  1. EXIF-orientatie wordt toegepast (PIL exif_transpose) zodat alle detectoren een
+     rechtopstaande foto zien — anders mist HOG een zijwaarts gezicht en pikt het een
+     false positive in de achtergrond op.
+  2. Kandidaten kleiner dan `min_ratio` × de korte zijde worden weggegooid (vrijwel
+     altijd false positives, bv. een patroon in stof).
+  3. Onder de overgebleven kandidaten wint die welke door de MEESTE detectoren wordt
+     bevestigd (overlappende box van een ándere detector, IoU ≥ 0.3); bij gelijke stand
+     het grootste oppervlak. Consensus onderdrukt losse false positives.
 
 Gebruik:
-    ozk-facedetect <afbeeldingspad>
+    ozk-facedetect <afbeeldingspad> [min_ratio]
+
+    min_ratio  minimale gezichtsgrootte als fractie van de korte zijde (default 0.08).
 
 Uitvoer bij gezicht gevonden:
-    {"found": true, "top": 120, "right": 340, "bottom": 290, "left": 170}
+    {"found": true, "top": .., "right": .., "bottom": .., "left": ..,
+     "img_width": .., "img_height": .., "detector": "yunet",
+     "detectors_run": ["hog","yunet"], "support": 1}
 
-Uitvoer zonder gezicht:
-    {"found": false}
+Uitvoer zonder (betrouwbaar) gezicht:
+    {"found": false, "img_width": .., "img_height": ..}
 
-Exitcode 0 = OK (ook als geen gezicht); exitcode 1 = fout (bestand niet gevonden etc.)
+Exitcode 0 = OK (ook als geen gezicht); 1 = fout (bestand niet gevonden etc.)
 """
+
+import os
+# Onderdruk eventuele log-ruis op stderr zodat stdout zuivere JSON blijft.
+os.environ.setdefault("GLOG_minloglevel", "3")
 
 import sys
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+BIN_DIR     = os.path.dirname(os.path.abspath(__file__))
+YUNET_MODEL = os.path.join(BIN_DIR, "face_detection_yunet_2023mar.onnx")
+
+# Detectie draait op een VERKLEINDE kopie (langste zijde ≤ DETECT_MAX). We zoeken
+# alleen de bounding box; de crop gebeurt later op het volle origineel, dus dit kost
+# geen kwaliteit. Voordeel: HOG wordt veel sneller én de dlib-CNN (die op een 5K-foto
+# het geheugen opblaast) past nu wél. Coördinaten worden teruggeschaald naar de
+# afmetingen van de aangeleverde foto.
+DETECT_MAX  = 1600
+
+
+def _laad_afbeelding_rechtop(pad):
+    """Laad als RGB numpy-array met toegepaste EXIF-orientatie."""
+    import numpy as np
+    import PIL.Image
+    from PIL import ImageOps
+    pil = PIL.Image.open(pad)
+    pil = ImageOps.exif_transpose(pil)
+    return np.ascontiguousarray(np.array(pil.convert("RGB")))
+
+
+# --- Detectoren -----------------------------------------------------------------
+# Elke detector geeft een lijst tuples terug: (top, right, bottom, left, score, naam).
+
+def _detect_hog(img):
+    import face_recognition
+    out = []
+    for (top, right, bottom, left) in face_recognition.face_locations(img, model="hog"):
+        out.append((int(top), int(right), int(bottom), int(left), 1.0, "hog"))
+    return out
+
+
+def _detect_yunet(img):
+    import cv2
+    if not os.path.isfile(YUNET_MODEL):
+        return []
+    h, w = img.shape[:2]
+    bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    det = cv2.FaceDetectorYN_create(YUNET_MODEL, "", (w, h), 0.6)
+    det.setInputSize((w, h))
+    _n, faces = det.detect(bgr)
+    out = []
+    if faces is not None:
+        for f in faces:
+            x, y, fw, fh = (int(f[0]), int(f[1]), int(f[2]), int(f[3]))
+            out.append((y, x + fw, y + fh, x, float(f[-1]), "yunet"))
+    return out
+
+
+def _detect_cnn(img):
+    # dlib's CNN-gezichtsdetector (mmod) — beter op gedraaide/scheve gezichten, maar
+    # zwaar op CPU. Draait daarom uitsluitend op de al-verkleinde detectie-kopie.
+    # number_of_times_to_upsample=0 is cruciaal: de default (1) verviervoudigt het
+    # werk/geheugen en laat CNN op ~1600px vastlopen; met 0 is het ~4-6s en vindt het
+    # portret-gezichten prima (we detecteren toch op de verkleinde kopie).
+    import face_recognition
+    out = []
+    for (top, right, bottom, left) in face_recognition.face_locations(img, model="cnn", number_of_times_to_upsample=0):
+        out.append((int(top), int(right), int(bottom), int(left), 1.0, "cnn"))
+    return out
+
+
+# Vergelijkmodus (--all) draait alle drie naast elkaar (MediaPipe is verwijderd:
+# short-range model faalde op afstandsfoto's en is van de server gehaald).
+DETECTORS_ALL = [_detect_hog, _detect_yunet, _detect_cnn]
+
+# Productie-cascade:
+#   1. PRIMARY: YuNet + HOG parallel (snel, ~2-3s). YuNet is de betrouwbaarste
+#      all-rounder, HOG de goedkope tweede stem (consensus + vangt YuNet-missers op).
+#   2. FALLBACK: alleen CNN erbij wanneer PRIMARY niets bruikbaars vindt — dan pas
+#      betaal je de ~9s, en alleen bij de zeldzame moeilijke foto.
+PROD_PRIMARY  = [_detect_yunet, _detect_hog]
+PROD_FALLBACK = [_detect_cnn]
+
+
+def _iou(a, b):
+    at, ar, ab, al = a[:4]
+    bt, br, bb_, bl = b[:4]
+    ix1, iy1 = max(al, bl), max(at, bt)
+    ix2, iy2 = min(ar, br), min(ab, bb_)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    union = (ar - al) * (ab - at) + (br - bl) * (bb_ - bt) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _timed(fn, img):
+    """Draai één detector en meet de duur in ms."""
+    import time
+    t0 = time.time()
+    boxes = fn(img)
+    return int(round((time.time() - t0) * 1000)), boxes
+
+
+def _schaal_voor_detectie(img):
+    """Geef een verkleinde detectie-kopie (langste zijde ≤ DETECT_MAX) + de schaalfactor
+    waarmee gevonden coördinaten teruggerekend moeten worden naar de originele afmetingen."""
+    import numpy as np
+    import PIL.Image
+    h, w = img.shape[:2]
+    factor = min(1.0, float(DETECT_MAX) / max(w, h))
+    if factor >= 1.0:
+        return img, 1.0
+    klein = PIL.Image.fromarray(img).resize((max(1, int(w * factor)), max(1, int(h * factor))))
+    return np.ascontiguousarray(np.array(klein)), factor
+
+
+def _run_detectors(img, detectors):
+    """Draai de gegeven detectoren parallel. Geeft per detector {ms, boxes, error?} terug.
+    Detectie loopt op een verkleinde kopie; coördinaten worden hier teruggeschaald
+    naar de afmetingen van het aangeleverde beeld."""
+    det_img, factor = _schaal_voor_detectie(img)
+    inv = (1.0 / factor) if factor else 1.0
+
+    def _herschaal(boxes):
+        if factor >= 1.0:
+            return boxes
+        out = []
+        for (t, r, b, l, sc, nm) in boxes:
+            out.append((int(round(t * inv)), int(round(r * inv)),
+                        int(round(b * inv)), int(round(l * inv)), sc, nm))
+        return out
+
+    resultaten = {}
+
+    def _verwerk(naam, fut_of_call):
+        try:
+            ms, boxes = fut_of_call()
+            resultaten[naam] = {"ms": ms, "boxes": _herschaal(boxes)}
+        except Exception as e:
+            # Detector ontbreekt of faalt → overslaan; de overige draaien door.
+            resultaten[naam] = {"ms": None, "boxes": [], "error": str(e)[:200]}
+
+    # CNN is CPU-vretend: parallel mét de anderen verhongert iedereen (alles → ~40s).
+    # Daarom de lichte detectoren parallel, en CNN dáárna sequentieel (volle CPU → snel).
+    HEAVY = {"_detect_cnn"}
+    licht = [fn for fn in detectors if fn.__name__ not in HEAVY]
+    zwaar = [fn for fn in detectors if fn.__name__ in HEAVY]
+
+    if licht:
+        with ThreadPoolExecutor(max_workers=len(licht)) as ex:
+            futures = {ex.submit(_timed, fn, det_img): fn.__name__ for fn in licht}
+            for fut in as_completed(futures):
+                naam = futures[fut].replace("_detect_", "")
+                _verwerk(naam, fut.result)
+
+    for fn in zwaar:
+        naam = fn.__name__.replace("_detect_", "")
+        _verwerk(naam, (lambda f=fn: _timed(f, det_img)))
+
+    return resultaten
+
+
+def _kies_beste(resultaten, min_px):
+    """Filter op grootte en kies de door consensus bevestigde, grootste box."""
+    kandidaten = []
+    for naam, r in resultaten.items():
+        kandidaten.extend(r["boxes"])
+    plausibel = [c for c in kandidaten
+                 if max(c[1] - c[3], c[2] - c[0]) >= min_px]
+    if not plausibel:
+        return None, plausibel
+
+    def support(c):
+        return sum(1 for o in plausibel
+                   if o is not c and o[5] != c[5] and _iou(c, o) >= 0.3)
+
+    def oppervlak(c):
+        return (c[1] - c[3]) * (c[2] - c[0])
+
+    beste = max(plausibel, key=lambda c: (support(c), oppervlak(c)))
+    return (beste, support(beste)), plausibel
+
 
 def main():
-    if len(sys.argv) < 2:
+    args = [a for a in sys.argv[1:]]
+    alle_modus = "--all" in args
+    args = [a for a in args if a != "--all"]
+
+    if not args:
         print(json.dumps({"error": "geen bestandspad opgegeven"}))
         sys.exit(1)
 
-    pad = sys.argv[1]
+    pad = args[0]
+    try:
+        min_ratio = float(args[1]) if len(args) > 1 else 0.08
+    except ValueError:
+        min_ratio = 0.08
 
     try:
-        import face_recognition
-        import PIL.Image
-    except ImportError as e:
-        print(json.dumps({"error": f"module niet gevonden: {e}"}))
-        sys.exit(1)
-
-    try:
-        afbeelding = face_recognition.load_image_file(pad)
+        img = _laad_afbeelding_rechtop(pad)
     except Exception as e:
         print(json.dumps({"error": f"bestand laden mislukt: {e}"}))
         sys.exit(1)
 
-    # model="hog" = snel; model="cnn" = nauwkeuriger maar zwaarder
-    gezichten = face_recognition.face_locations(afbeelding, model="hog")
+    img_hoogte, img_breedte = img.shape[:2]
+    min_px = int(round(min(img_breedte, img_hoogte) * min_ratio))
 
-    if not gezichten:
-        print(json.dumps({"found": False}))
+    if alle_modus:
+        # Vergelijkmodus: alle drie detectoren naast elkaar.
+        resultaten = _run_detectors(img, DETECTORS_ALL)
+    else:
+        # Productie-cascade: eerst YuNet+HOG; CNN alleen als vangnet als die niets vinden.
+        resultaten = _run_detectors(img, PROD_PRIMARY)
+        if not _kies_beste(resultaten, min_px)[0]:
+            resultaten.update(_run_detectors(img, PROD_FALLBACK))
+
+    beste_info, plausibel = _kies_beste(resultaten, min_px)
+
+    def _clamp(top, right, bottom, left):
+        return (max(0, min(top, img_hoogte)), max(0, min(right, img_breedte)),
+                max(0, min(bottom, img_hoogte)), max(0, min(left, img_breedte)))
+
+    # --- VERGELIJKMODUS: geef élke detector apart terug (box + timing). ----------
+    if alle_modus:
+        det_out = []
+        for naam in sorted(resultaten):
+            r = resultaten[naam]
+            # Grootste box van deze detector (ongefilterd, zodat je ook false positives ziet).
+            grootste = None
+            if r["boxes"]:
+                g = max(r["boxes"], key=lambda c: (c[1] - c[3]) * (c[2] - c[0]))
+                t, rr, b, l = _clamp(g[0], g[1], g[2], g[3])
+                grootste = {"top": t, "right": rr, "bottom": b, "left": l, "score": round(g[4], 3)}
+            entry = {"name": naam, "ms": r["ms"], "largest": grootste, "count": len(r["boxes"])}
+            if "error" in r:
+                entry["error"] = r["error"]
+            det_out.append(entry)
+
+        best_out = None
+        if beste_info:
+            b, sup = beste_info
+            t, rr, bo, l = _clamp(b[0], b[1], b[2], b[3])
+            best_out = {"top": t, "right": rr, "bottom": bo, "left": l,
+                        "detector": b[5], "score": round(b[4], 3), "support": sup}
+
+        print(json.dumps({
+            "img_width": img_breedte, "img_height": img_hoogte,
+            "min_px": min_px, "detectors": det_out, "best": best_out,
+        }))
         sys.exit(0)
 
-    # Kies het grootste gezicht (meeste pixels)
-    def oppervlak(loc):
-        top, right, bottom, left = loc
-        return (bottom - top) * (right - left)
+    # --- STANDAARD: alleen het beste gezicht (productiepad). ---------------------
+    if not beste_info:
+        print(json.dumps({"found": False,
+                          "img_width": img_breedte, "img_height": img_hoogte,
+                          "detectors_run": sorted(resultaten)}))
+        sys.exit(0)
 
-    top, right, bottom, left = max(gezichten, key=oppervlak)
-
+    beste, sup = beste_info
+    top, right, bottom, left = _clamp(beste[0], beste[1], beste[2], beste[3])
     print(json.dumps({
-        "found": True,
-        "top":    top,
-        "right":  right,
-        "bottom": bottom,
-        "left":   left,
+        "found":         True,
+        "top":           top,
+        "right":         right,
+        "bottom":        bottom,
+        "left":          left,
+        "img_width":     img_breedte,
+        "img_height":    img_hoogte,
+        "detector":      beste[5],
+        "score":         round(beste[4], 3),
+        "support":       sup,
+        "detectors_run": sorted(resultaten),
     }))
     sys.exit(0)
+
 
 if __name__ == "__main__":
     main()

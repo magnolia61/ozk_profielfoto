@@ -33,6 +33,141 @@ function ozk_profielfoto_entity_update($entity, $type) {
 }
 
 /**
+ * Implements hook_webform_submission_insert().
+ * Koppelt autocrop + derivative-generatie aan uploads via webform node 608 (Profielfoto).
+ */
+function ozk_profielfoto_webform_submission_insert($node, $submission) {
+    _ozk_profielfoto_webform_foto_verwerken($node, $submission);
+}
+
+/**
+ * Implements hook_webform_submission_update().
+ */
+function ozk_profielfoto_webform_submission_update($node, $submission) {
+    _ozk_profielfoto_webform_foto_verwerken($node, $submission);
+}
+
+/**
+ * Gedeelde logica voor webform-submission insert + update van node 608.
+ * Voert face-detect autocrop uit en genereert alle derivatives inclusief square_profielfoto_crop.
+ */
+function _ozk_profielfoto_webform_foto_verwerken($node, $submission) {
+    if ($node->nid != 608) {
+        return;
+    }
+
+    // Component cid=7 = profielfoto file-veld in webform 608.
+    $fid = !empty($submission->data[7][0]) ? (int) $submission->data[7][0] : 0;
+    if (!$fid) {
+        watchdog('ozk_profielfoto', 'webform 608: geen fid in submission data[7]', [], WATCHDOG_WARNING);
+        return;
+    }
+
+    $bestand = file_load($fid);
+    if (!$bestand) {
+        watchdog('ozk_profielfoto', 'webform 608: file_load(@fid) mislukt', ['@fid' => $fid], WATCHDOG_WARNING);
+        return;
+    }
+
+    $pad = drupal_realpath($bestand->uri);
+    if (!$pad || !is_file($pad)) {
+        watchdog('ozk_profielfoto', 'webform 608: bestand niet op schijf: @uri', ['@uri' => $bestand->uri], WATCHDOG_WARNING);
+        return;
+    }
+
+    // TIJDELIJKE VERGELIJKMODUS — zie entityform-pad. Draait op het origineel vóór de crop.
+    if (variable_get('ozk_profielfoto_vergelijk', FALSE)) {
+        module_load_include('inc', 'ozk_profielfoto', 'ozk_profielfoto.vergelijk');
+        if (function_exists('_ozk_profielfoto_vergelijk_varianten')) {
+            _ozk_profielfoto_vergelijk_varianten($pad, ['uid' => $submission->uid]);
+        }
+    }
+
+    // Face-detect autocrop (zelfde kernlogica als entityform-upload).
+    _ozk_profielfoto_autocrop_op_pad($pad, $bestand);
+
+    // De webform-filecomponent slaat op in private:// → de URL wordt /system/files/...
+    // (toegangs-gecontroleerd: 403 voor anonieme bezoekers en e-mailclients → blanco
+    // foto in de mail). Verplaats daarom een publieke kopie naar de master-map, net als
+    // de entityform-route, en push DIE publieke URL naar CiviCRM.
+    $publiek = _ozk_profielfoto_kopieer_naar_public_master($bestand, $submission->uid);
+    if ($publiek) {
+        _ozk_profielfoto_push_image_url_naar_civicrm($submission->uid, $publiek['url'], $publiek['uri']);
+    }
+    else {
+        // Terugval (zou niet moeten gebeuren): gebruik de ruwe URL.
+        watchdog('ozk_profielfoto', 'webform 608: public-master kopie mislukt voor uid @u, val terug op ruwe URL.', ['@u' => $submission->uid], WATCHDOG_WARNING);
+        _ozk_profielfoto_push_image_url_naar_civicrm($submission->uid, file_create_url($bestand->uri), $bestand->uri);
+    }
+}
+
+/**
+ * =======================================================================================
+ * HELPER: _ozk_profielfoto_kopieer_naar_public_master
+ * =======================================================================================
+ * Kopieert een (al gecropte) profielfoto naar de PUBLIEKE master-map
+ * public://profielfotos/<slug>_<cid>_<Ymd>_<Hi>.<ext>, gelijk aan de entityform-route,
+ * zodat image_URL en alle image-styles publiek bereikbaar zijn. Nodig voor de
+ * webform-route, die in private:// opslaat (→ /system/files, 403 in mail/anoniem).
+ *
+ * @param stdClass $bestand  Drupal file-object (uri wijst naar het bronbestand op schijf).
+ * @param int      $uid      Drupal user-id van de indiener.
+ * @return array|false       ['uri' => 'public://...', 'url' => 'https://...'] of FALSE.
+ */
+function _ozk_profielfoto_kopieer_naar_public_master($bestand, $uid) {
+    if (!civicrm_initialize()) {
+        return FALSE;
+    }
+
+    $contact_id = CRM_Core_BAO_UFMatch::getContactId($uid);
+    if (!$contact_id) {
+        return FALSE;
+    }
+
+    // Slug uit display_name (alleen letters/cijfers, lowercase); val terug op 'foto'.
+    $naam = '';
+    try {
+        $r    = civicrm_api4('Contact', 'get', [
+            'checkPermissions' => FALSE,
+            'select'           => ['display_name'],
+            'where'            => [['id', '=', $contact_id]],
+        ]);
+        $naam = $r->first()['display_name'] ?? '';
+    }
+    catch (Exception $e) {
+        // display_name niet ophaalbaar → slug wordt 'foto'.
+    }
+    $slug = strtolower(preg_replace('/[^a-z0-9]/i', '', $naam));
+    if ($slug === '') {
+        $slug = 'foto';
+    }
+
+    $bron = drupal_realpath($bestand->uri);
+    if (!$bron || !is_file($bron)) {
+        return FALSE;
+    }
+    $ext = strtolower(pathinfo($bestand->filename, PATHINFO_EXTENSION));
+    if ($ext === '') {
+        $ext = 'jpg';
+    }
+
+    $dir = 'public://profielfotos';
+    if (!file_prepare_directory($dir, FILE_CREATE_DIRECTORY)) {
+        watchdog('ozk_profielfoto', 'public-master map niet schrijfbaar: @d', ['@d' => $dir], WATCHDOG_ERROR);
+        return FALSE;
+    }
+
+    $doel  = $dir . '/' . $slug . '_' . $contact_id . '_' . date('Ymd_Hi') . '.' . $ext;
+    $nieuw = file_unmanaged_copy($bron, $doel, FILE_EXISTS_REPLACE);
+    if (!$nieuw) {
+        return FALSE;
+    }
+
+    watchdog('ozk_profielfoto', 'webform-foto naar public master gekopieerd: @u', ['@u' => $nieuw], WATCHDOG_INFO);
+    return ['uri' => $nieuw, 'url' => file_create_url($nieuw)];
+}
+
+/**
  * Implements hook_form_alter().
  */
 function ozk_profielfoto_form_alter(&$form, &$form_state, $form_id) {
@@ -186,9 +321,6 @@ function _ozk_profielfoto_is_mobiel() {
  * bestandsinhoud en afmetingen veranderen.
  */
 function _ozk_profielfoto_autocrop_op_gezicht($entity) {
-    $extdebug = 'ozk_profielfoto';
-    $t_start  = microtime(TRUE);
-
     $veld = field_get_items('entityform', $entity, 'field_profielfoto');
     if (empty($veld[0]['fid'])) {
         return;
@@ -201,19 +333,66 @@ function _ozk_profielfoto_autocrop_op_gezicht($entity) {
 
     $pad = drupal_realpath($bestand->uri);
     if (!$pad || !is_file($pad)) {
-        watchdog($extdebug, 'autocrop: bestand niet gevonden op schijf: @uri', ['@uri' => $bestand->uri], WATCHDOG_WARNING);
+        watchdog('ozk_profielfoto', 'autocrop: bestand niet gevonden op schijf: @uri', ['@uri' => $bestand->uri], WATCHDOG_WARNING);
         return;
     }
 
+    // TIJDELIJKE VERGELIJKMODUS (drush vset ozk_profielfoto_vergelijk 1): maak en mail
+    // een montage van álle detector- + crop-varianten op het ORIGINEEL, vóór de
+    // productie-crop hieronder het bestand overschrijft. Productie blijft ongewijzigd.
+    if (variable_get('ozk_profielfoto_vergelijk', FALSE)) {
+        module_load_include('inc', 'ozk_profielfoto', 'ozk_profielfoto.vergelijk');
+        if (function_exists('_ozk_profielfoto_vergelijk_varianten')) {
+            _ozk_profielfoto_vergelijk_varianten($pad, ['uid' => $entity->uid]);
+        }
+    }
+
+    _ozk_profielfoto_autocrop_op_pad($pad, $bestand);
+}
+
+/**
+ * Kernlogica van de autocrop: werkt op een absoluut bestandspad.
+ * Wordt aangeroepen vanuit zowel entityform- als webform-uploads.
+ *
+ * @param string        $pad      Absoluut pad naar het bronbestand (wordt IN PLACE overschreven).
+ * @param object|null   $bestand  Drupal file-object (voor file_save na overschrijven); NULL = geen DB-update.
+ */
+function _ozk_profielfoto_autocrop_op_pad($pad, $bestand = NULL) {
+    $extdebug = 'ozk_profielfoto';
+    $t_start  = microtime(TRUE);
+
+    // ------------------------------------------------------------------ 0. Orientatie normaliseren
+    // Bak een eventuele EXIF-rotatie IN het bestand voordat we iets meten of snijden.
+    // Reden: de detector (Python/HOG) én getimagesize() werken op de rauwe pixels, maar
+    // de crop hieronder draait 'magick -auto-orient' (roteert eerst). Bij een gekantelde
+    // telefoonfoto verschillen die twee coördinaatruimtes → de crop valt op de verkeerde
+    // plek, en de HOG-detector mist het zijwaartse gezicht (→ false positive in de
+    // achtergrond, zoals bij Loa). Na normaliseren zitten detectie, geometrie en crop
+    // allemaal in dezelfde, opgerichte ruimte. Alleen herschrijven als er echt rotatie is,
+    // zodat we niet onnodig hercomprimeren.
+    $orient = trim((string) shell_exec('magick identify -format %[orientation] ' . escapeshellarg($pad . '[0]') . ' 2>/dev/null'));
+    if ($orient !== '' && $orient !== 'TopLeft' && $orient !== 'Undefined') {
+        exec('magick ' . escapeshellarg($pad . '[0]') . ' -auto-orient +repage -quality 95 ' . escapeshellarg($pad), $uo, $rvo);
+        watchdog($extdebug, 'autocrop: EXIF-orientatie @o genormaliseerd voor @f', ['@o' => $orient, '@f' => basename($pad)], WATCHDOG_INFO);
+        if ($bestand) {
+            $bestand->filesize = filesize($pad);
+        }
+    }
+
     // ------------------------------------------------------------------ 1. Gezicht detecteren
-    // Verkleinde werkkopie voor snellere detectie (dlib schaal O(n²) mee met pixels).
+    // Detectie op origineel of max 4320px (2×2160) zodat kleine gezichten goed gevonden
+    // worden. Alleen verkleinen als bron groter is dan 4320px (zelden bij normale uploads).
     $script       = dirname(__FILE__) . '/bin/ozk-facedetect';
+    // Minimale gezichtsgrootte als fractie van de korte zijde. Eén bron van waarheid:
+    // doorgegeven aan de detector (filtert false positives al in Python) én hergebruikt
+    // door de plausibiliteitsguard hieronder (sectie 3a) als backstop.
+    $min_face_ratio = 0.08;
     $tmp_detect   = $pad . '.detect.jpg';
     $img_info_pre = getimagesize($pad);
     $schaal       = 1.0;
     $t_pre        = microtime(TRUE);
-    if ($img_info_pre && max($img_info_pre[0], $img_info_pre[1]) > 800) {
-        exec('magick ' . escapeshellarg($pad . '[0]') . " -resize '800x800>' " . escapeshellarg($tmp_detect));
+    if ($img_info_pre && max($img_info_pre[0], $img_info_pre[1]) > 4320) {
+        exec('magick ' . escapeshellarg($pad . '[0]') . " -resize '4320x4320>' " . escapeshellarg($tmp_detect));
         $tmp_info = getimagesize($tmp_detect);
         if ($tmp_info) {
             $schaal = $img_info_pre[0] / $tmp_info[0];
@@ -227,7 +406,10 @@ function _ozk_profielfoto_autocrop_op_gezicht($entity) {
         ['@ms' => round(($t_preshrink - $t_pre) * 1000), '@b' => $img_info_pre[0] ?? '?',
          '@h' => $img_info_pre[1] ?? '?', '@dp' => basename($detect_pad)], WATCHDOG_DEBUG);
 
-    $cmd_detect = escapeshellarg($script) . ' ' . escapeshellarg($detect_pad);
+    // De detector draait meerdere engines parallel (HOG + YuNet + evt. MediaPipe) en
+    // geeft het beste, door consensus bevestigde gezicht terug; te kleine kandidaten
+    // (false positives) worden binnen het script al weggefilterd op $min_face_ratio.
+    $cmd_detect = escapeshellarg($script) . ' ' . escapeshellarg($detect_pad) . ' ' . escapeshellarg((string) $min_face_ratio);
     $json_raw   = shell_exec($cmd_detect);
     $t_detect   = microtime(TRUE);
     watchdog($extdebug, 'TIMING facedetect: @ms ms', ['@ms' => round(($t_detect - $t_preshrink) * 1000)], WATCHDOG_DEBUG);
@@ -248,17 +430,24 @@ function _ozk_profielfoto_autocrop_op_gezicht($entity) {
         ];
     }
 
+    $_bestandsnaam = $bestand ? $bestand->filename : basename($pad);
+
     if (empty($gezicht['found'])) {
-        // Geen gezicht gevonden → val terug op gecentreerde vierkante crop (entropy-vrij).
-        watchdog($extdebug, 'autocrop: geen gezicht gevonden in @f, val terug op midden-crop.', ['@f' => $bestand->filename], WATCHDOG_INFO);
-        _ozk_profielfoto_autocrop_midden($pad);
+        // Geen gezicht gevonden → foto ONAANGEROERD laten (volledige foto bewaren).
+        // De vierkante image-styles (square_0260 = image_scale_and_crop, gecentreerd)
+        // maken bij weergave alsnog een vierkant. Beter een volledige foto dan een
+        // gokkende crop. (We laten alleen de evt. orientatie-normalisatie van sectie 0 staan.)
+        watchdog($extdebug, 'autocrop: geen gezicht gevonden in @f → foto onaangeroerd gelaten (image-styles maken vierkant).', ['@f' => $_bestandsnaam], WATCHDOG_INFO);
+        if ($bestand) {
+            file_save($bestand);
+        }
         return;
     }
 
     watchdog($extdebug, 'autocrop: gezicht gevonden top=@t right=@r bottom=@b left=@l in @f', [
         '@t' => $gezicht['top'], '@r' => $gezicht['right'],
         '@b' => $gezicht['bottom'], '@l' => $gezicht['left'],
-        '@f' => $bestand->filename,
+        '@f' => $_bestandsnaam,
     ], WATCHDOG_INFO);
 
     // ------------------------------------------------------------------ 2. Afmetingen origineel
@@ -281,6 +470,23 @@ function _ozk_profielfoto_autocrop_op_gezicht($entity) {
     $gz_cx     = (int) round(($gz_left + $gz_right)  / 2);
     $gz_cy     = (int) round(($gz_top  + $gz_bottom) / 2);
 
+    // ------------------------------------------------------------------ 3a. Plausibiliteitscheck
+    // Een te klein "gezicht" t.o.v. de foto is vrijwel zeker een false positive: de
+    // HOG-detector pikt soms een patroon in stof/achtergrond op (bv. Loa: 107 px breed
+    // in een 4032 px brede foto → 2.5× padding gaf een 268 px micro-crop, extreem
+    // ingezoomd). Echte portretten hier zitten op 15–30% van de korte zijde. Drempel
+    // = 8% van de korte zijde; daaronder vertrouwen we de detectie niet en laten we de
+    // foto ONAANGEROERD (image-styles maken alsnog een gecentreerd vierkant).
+    $drempel_px = (int) round(min($img_breed, $img_hoogte) * $min_face_ratio);
+    if (max($gz_breed, $gz_hoogte) < $drempel_px) {
+        watchdog($extdebug, 'autocrop: gezicht te klein (@gz px < drempel @d px) in @f → waarschijnlijk false positive, foto onaangeroerd gelaten.',
+            ['@gz' => max($gz_breed, $gz_hoogte), '@d' => $drempel_px, '@f' => $_bestandsnaam], WATCHDOG_WARNING);
+        if ($bestand) {
+            file_save($bestand);
+        }
+        return;
+    }
+
     // Padding: 2.5× de gezichtshoogte → ruimte voor kruin + schouders
     $zijde = (int) round(max($gz_breed, $gz_hoogte) * 2.5);
     $zijde = max($zijde, 100); // minimaal 100px
@@ -294,11 +500,13 @@ function _ozk_profielfoto_autocrop_op_gezicht($entity) {
     $crop_top  = max(0, min($crop_top,  $img_hoogte - $zijde));
     $zijde     = min($zijde, $img_breed, $img_hoogte);
 
-    // ------------------------------------------------------------------ 4. Crop + resize met ImageMagick
-    // Max 400×400 zodat het bestand onder de 150KB cssinliner-embed-limiet blijft.
+    // ------------------------------------------------------------------ 4. Crop met ImageMagick (géén resize hier)
+    // Bronbestand blijft op originele resolutie; _ozk_profielfoto_push_image_url_naar_civicrm
+    // schaalt daarna op naar ≥2160px. Kleine derivatives (square_0260 etc.) worden via
+    // image_style_create_derivative gemaakt — die zorgen zelf voor de juiste uitvoergrootte.
     $geometry = sprintf('%dx%d+%d+%d', $zijde, $zijde, $crop_left, $crop_top);
     $cmd_crop = sprintf(
-        'magick %s -crop %s +repage -auto-orient -resize 400x400 -quality 85 %s',
+        'magick %s -crop %s +repage -auto-orient -quality 92 %s',
         escapeshellarg($pad . '[0]'),
         escapeshellarg($geometry),
         escapeshellarg($pad)
@@ -308,16 +516,18 @@ function _ozk_profielfoto_autocrop_op_gezicht($entity) {
     watchdog($extdebug, 'TIMING ImageMagick crop+resize: @ms ms', ['@ms' => round(($t_crop - $t_detect) * 1000)], WATCHDOG_DEBUG);
 
     if ($rv !== 0) {
-        watchdog($extdebug, 'autocrop: ImageMagick crop mislukt (rv=@rv) voor @f', ['@rv' => $rv, '@f' => $bestand->filename], WATCHDOG_ERROR);
+        watchdog($extdebug, 'autocrop: ImageMagick crop mislukt (rv=@rv) voor @f', ['@rv' => $rv, '@f' => $_bestandsnaam], WATCHDOG_ERROR);
         return;
     }
 
-    // Bestandsgrootte in DB bijwerken na overschrijven
-    $bestand->filesize = filesize($pad);
-    file_save($bestand);
+    // Bestandsgrootte in DB bijwerken na overschrijven (alleen als file-object beschikbaar).
+    if ($bestand) {
+        $bestand->filesize = filesize($pad);
+        file_save($bestand);
+    }
 
     watchdog($extdebug, 'autocrop: crop geslaagd (@g) voor @f — totaal @ms ms',
-        ['@g' => $geometry, '@f' => $bestand->filename, '@ms' => round((microtime(TRUE) - $t_start) * 1000)], WATCHDOG_INFO);
+        ['@g' => $geometry, '@f' => $_bestandsnaam, '@ms' => round((microtime(TRUE) - $t_start) * 1000)], WATCHDOG_INFO);
 }
 
 /**
@@ -325,7 +535,7 @@ function _ozk_profielfoto_autocrop_op_gezicht($entity) {
  */
 function _ozk_profielfoto_autocrop_midden($pad) {
     $cmd = sprintf(
-        'magick %s -gravity Center -extent "%%[fx:min(w,h)]x%%[fx:min(w,h)]" +repage -resize 400x400 -quality 85 %s',
+        'magick %s -gravity Center -extent "%%[fx:min(w,h)]x%%[fx:min(w,h)]" +repage -quality 92 %s',
         escapeshellarg($pad . '[0]'),
         escapeshellarg($pad)
     );
@@ -599,13 +809,61 @@ function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url, $drupal_
 			if ($drupal_uri) {
 				$_lokpad = drupal_realpath($drupal_uri);
 				$_img    = @getimagesize($_lokpad);
+				$_fid_mc = db_query("SELECT fid FROM {file_managed} WHERE uri = :uri", [':uri' => $drupal_uri])->fetchField();
 				if ($_img && $_img[0] < 2160) {
+					$_orig_w = $_img[0];
+					$_orig_h = $_img[1];
 					exec('magick ' . escapeshellarg($_lokpad . '[0]') .
 						' -resize 2160x2160' .
 						' -quality 92 ' . escapeshellarg($_lokpad));
 					wachthond($extdebug, 3, 'bron opgeschaald naar 2160px tbv image_style', basename($_lokpad));
+					// Schaal ook de manualcrop-coördinaten proportioneel mee, anders
+					// verwijzen ze nog naar de kleinere originele dimensies en levert
+					// image_style_create_derivative een verkeerde/lege crop op.
+					$_new_img = @getimagesize($_lokpad);
+					if ($_fid_mc && $_new_img && $_new_img[0] !== $_orig_w) {
+						$_sx = $_new_img[0] / $_orig_w;
+						$_sy = $_new_img[1] / $_orig_h;
+						db_query(
+							"UPDATE {manualcrop} SET x=ROUND(x*:sx), y=ROUND(y*:sy), width=ROUND(width*:sx), height=ROUND(height*:sy) WHERE fid=:fid",
+							[':sx' => $_sx, ':sy' => $_sy, ':fid' => $_fid_mc]
+						);
+						wachthond($extdebug, 1, 'manualcrop coords meeopgeschaald', "sx={$_sx} sy={$_sy}");
+					}
 				}
-				foreach (['square_profielfoto', 'square_0260', 'square_0260_naam'] as $_style_name) {
+				// Vang ook het geval waar de bron al verkleind was ten opzichte van de
+				// originele upload (bijv. iOS-foto op lagere resolutie gedeeld): als de
+				// manualcrop-coördinaten de huidige brondimensies overschrijden, schaal
+				// ze dan proportioneel terug zodat de crop wél past.
+				$_src_now = @getimagesize($_lokpad);
+				if ($_fid_mc && $_src_now) {
+					$_mc_row = db_query(
+						"SELECT x, y, width, height FROM {manualcrop} WHERE fid=:fid AND style_name='square_profielfoto'",
+						[':fid' => $_fid_mc]
+					)->fetchAssoc();
+					if ($_mc_row) {
+						$_mc_right  = $_mc_row['x'] + $_mc_row['width'];
+						$_mc_bottom = $_mc_row['y'] + $_mc_row['height'];
+						if ($_mc_right > $_src_now[0] || $_mc_bottom > $_src_now[1]) {
+							$_scale = min(
+								$_src_now[0] / max($_mc_right, 1),
+								$_src_now[1] / max($_mc_bottom, 1)
+							);
+							db_update('manualcrop')
+								->fields([
+									'x'      => (int)round($_mc_row['x']      * $_scale),
+									'y'      => (int)round($_mc_row['y']      * $_scale),
+									'width'  => (int)round($_mc_row['width']  * $_scale),
+									'height' => (int)round($_mc_row['height'] * $_scale),
+								])
+								->condition('fid',        $_fid_mc)
+								->condition('style_name', 'square_profielfoto')
+								->execute();
+							wachthond($extdebug, 1, 'manualcrop coords teruggeschaald (bron kleiner dan coords)', $_mc_row);
+						}
+					}
+				}
+				foreach (['square_profielfoto', 'square_profielfoto_crop', 'square_0260', 'square_0260_naam'] as $_style_name) {
 					$_style_def = image_style_load($_style_name);
 					if (!$_style_def) continue;
 					$_style_uri = image_style_path($_style_name, $drupal_uri);
@@ -657,17 +915,29 @@ function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url, $drupal_
 				wachthond($extdebug, 1, "sendTemplate 669 webteam mislukt", $sendEx->getMessage());
 			}
 
-			// Indiener-bevestiging (608).
-			try {
-				\CRM_Core_BAO_MessageTemplate::sendTemplate([
-					'messageTemplateID' => 608,
-					'contactId'         => $contact_id,
-					'from'              => 'OZK <info@onvergetelijk.nl>',
-					'tplParams'         => $tpl_params,
-				]);
-				wachthond($extdebug, 3, "mail 608 indiener verzonden", $contact_id);
-			} catch (\Throwable $sendEx) {
-				wachthond($extdebug, 1, "sendTemplate 608 indiener mislukt", $sendEx->getMessage());
+			// Indiener-bevestiging (608) naar primair e-mailadres van het contact.
+			// toEmail expliciet opzoeken: sendTemplate zonder toEmail faalt stil als
+			// het contact geen rij in civicrm_email heeft of de lookup niets oplevert.
+			$_to_email = CRM_Core_DAO::singleValueQuery(
+				'SELECT email FROM civicrm_email WHERE contact_id = %1 AND is_primary = 1 LIMIT 1',
+				[1 => [$contact_id, 'Integer']]
+			);
+			wachthond($extdebug, 3, 'mail 608 toEmail', $_to_email ?: '(geen)');
+			if ($_to_email) {
+				try {
+					\CRM_Core_BAO_MessageTemplate::sendTemplate([
+						'messageTemplateID' => 608,
+						'contactId'         => $contact_id,
+						'toEmail'           => $_to_email,
+						'from'              => 'OZK <info@onvergetelijk.nl>',
+						'tplParams'         => $tpl_params,
+					]);
+					wachthond($extdebug, 3, "mail 608 indiener verzonden", $_to_email);
+				} catch (\Throwable $sendEx) {
+					wachthond($extdebug, 1, "sendTemplate 608 indiener mislukt", $sendEx->getMessage());
+				}
+			} else {
+				wachthond($extdebug, 1, "mail 608 overgeslagen: geen primair e-mailadres voor contact", $contact_id);
 			}
 
 		} catch (\Exception $e) {

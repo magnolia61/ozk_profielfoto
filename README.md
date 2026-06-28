@@ -106,6 +106,74 @@ CiviCRM-upgrades. De regressietest
 `Civi\OzkTest\Security\ImagefileRouteTest` (extensie `nl.onvergetelijk.test`)
 bewaakt dat de route 200 + een afbeelding blijft geven.
 
+## Autocrop / gezichtsdetectie (`bin/ozk-facedetect`)
+
+Bij elke upload snijdt `_ozk_profielfoto_autocrop_op_pad()` de foto vierkant bij
+rondom het gezicht. De flow is hard afgesteld tegen twee echte fouten (28-jun-2026):
+
+1. **EXIF-orientatie wordt eerst in het bestand gebakken** (sectie 0). Detectie,
+   geometrie én de uiteindelijke crop werken zo in dezelfde, rechtopstaande
+   pixelruimte. Zonder dit kreeg een gekantelde telefoonfoto een verkeerde crop en
+   miste de detector het zijwaartse gezicht (→ false positive in de achtergrond).
+2. **Plausibiliteitsguard**: een "gezicht" kleiner dan `$min_face_ratio` (0.08) ×
+   de korte zijde is vrijwel zeker een false positive → de foto wordt **onaangeroerd**
+   gelaten (de vierkante image-styles maken alsnog een gecentreerd vierkant). Ook
+   "geen gezicht gevonden" laat de foto heel i.p.v. te gokken.
+
+`bin/ozk-facedetect` draait detectoren **parallel** (één Python-proces, ThreadPool)
+en kiest het door consensus bevestigde gezicht (overlap van ≥2 engines wint; daarna
+grootste oppervlak). Detectie loopt op een verkleinde kopie (`DETECT_MAX=1600`); de
+crop gebeurt op het volle origineel → geen kwaliteitsverlies, wél veel sneller.
+
+| Engine | Sterkte | Rol |
+|---|---|---|
+| OpenCV **YuNet** (ONNX, CPU) | robuustste all-rounder, ~1-2s | **productie (primair)** |
+| `face_recognition` (dlib **HOG**) | goede tweede stem, frontaal | **productie (consensus)** |
+| `face_recognition` (dlib **CNN**, mmod) | sterk op gedraaid/scheef, maar traag (~9s) | **vangnet + vergelijking** |
+
+**Productie-cascade** (alle 3 routes): YuNet + HOG parallel (~2-3s); **CNN alleen
+als vangnet** wanneer die twee niets bruikbaars vinden. Modellen lokaal in `bin/`
+(`face_detection_yunet_2023mar.onnx`; CNN-model zit in het `face_recognition`-pakket).
+Venv: `/home/webteam/venv/facedetect` (py3.13).
+
+> **MediaPipe is verwijderd** (28-jun-2026): het BlazeFace short-range model faalde
+> structureel op afstands-/ten-voeten-uit-foto's en koos in een multi-face-foto de
+> verkeerde persoon. Pakket ge-uninstalld uit de venv en model van schijf gehaald;
+> YuNet/HOG/CNN dekken de gevallen ruimschoots.
+
+### `--all`-modus (vergelijking)
+
+`ozk-facedetect <pad> [min_ratio] --all` geeft **élke** detector apart terug
+(grootste box + score + timing) plus de ensemble-winnaar — nu YuNet/HOG/CNN.
+Gebruikt door de tijdelijke vergelijkmodus hieronder.
+
+### Tijdelijke vergelijkmodus
+
+Voor het afstellen kun je bij **elke upload** een montage laten mailen met alle
+detector- én crop-varianten naast elkaar (volledige foto + getekende box én de
+resulterende crop; plus een matrix padding 2.0/2.5/3.0× × centrering 42/50% op de
+ensemble-winnaar). Code: `ozk_profielfoto.vergelijk.inc`. De productie-crop blijft
+ongewijzigd (de vergelijking draait op een tijdelijke kopie van het origineel).
+
+```bash
+drush vset ozk_profielfoto_vergelijk 1   # aan  → montage-mail naar webteam@ per upload
+drush vdel ozk_profielfoto_vergelijk     # uit
+```
+
+Montages komen in `public://profielfoto-vergelijk/`. Verwijderen later: het
+`.inc`-bestand + de twee `variable_get('ozk_profielfoto_vergelijk', …)`-aanroepen
+in de upload-paden weghalen.
+
+## Webform-route (node 608) → publieke master
+
+Naast pad A (entityform) en B (native CiviCRM) bestaat een **webform-upload**
+(`/form/profielfoto`, node 608, `_ozk_profielfoto_webform_foto_verwerken()`). De
+webform-filecomponent slaat op in `private://` → de URL wordt `/system/files/…`
+(toegangs-gecontroleerd: 403/404 voor anonieme bezoekers en mailclients → blanco
+foto). Daarom kopieert `_ozk_profielfoto_kopieer_naar_public_master()` de gecropte
+foto naar de **publieke** master-map `public://profielfotos/<slug>_<cid>_<datum>.<ext>`
+(gelijk aan pad A) en wordt **die** URL naar CiviCRM gepusht.
+
 ## Tests
 
 Unit-tests voor de module-functies draaien standalone (gestubde Drupal/CiviCRM):
