@@ -1011,6 +1011,39 @@ function _ozk_profielfoto_autocrop_op_pad($pad, $bestand = NULL) {
     $crop_top  = max(0, min($crop_top,  $img_hoogte - $zijde));
     $zijde     = min($zijde, $img_breed, $img_hoogte);
 
+    // ------------------------------------------------------------------ 3b. Hoofd-behoud
+    // Voorkom dat de crop de kruin/kin/zijkant van het HOOFD afsnijdt terwijl het
+    // origineel het hele hoofd wél bevatte (zoals bij Hannah: kruin werd weggesneden).
+    // De detector geeft alleen de GEZICHTSbox, dus schatten we een ruimere hoofd-box:
+    // kruin ~0.6× gezichtshoogte erboven, kin ~0.15× eronder, haar ~0.2× links/rechts.
+    // Past die hoofd-box in het origineel maar niet in de huidige crop, dan vergroten
+    // we het vierkant (tot het maximale = korte zijde) en centreren we op het hoofd,
+    // zodat het hele hoofd behouden blijft i.p.v. een strakkere, afsnijdende crop.
+    $hoofd_top    = $gz_top    - (int) round($gz_hoogte * 0.6);
+    $hoofd_bottom = $gz_bottom + (int) round($gz_hoogte * 0.15);
+    $hoofd_left   = $gz_left   - (int) round($gz_breed  * 0.2);
+    $hoofd_right  = $gz_right  + (int) round($gz_breed  * 0.2);
+    $hoofd_h      = $hoofd_bottom - $hoofd_top;
+    $hoofd_w      = $hoofd_right  - $hoofd_left;
+    $hoofd_cx     = (int) round(($hoofd_left + $hoofd_right)  / 2);
+    $hoofd_cy     = (int) round(($hoofd_top  + $hoofd_bottom) / 2);
+
+    $orig_bevat_hoofd  = ($hoofd_top >= 0 && $hoofd_bottom <= $img_hoogte
+                          && $hoofd_left >= 0 && $hoofd_right <= $img_breed);
+    $crop_bevat_hoofd  = ($crop_top <= $hoofd_top && ($crop_top + $zijde) >= $hoofd_bottom
+                          && $crop_left <= $hoofd_left && ($crop_left + $zijde) >= $hoofd_right);
+
+    if ($orig_bevat_hoofd && !$crop_bevat_hoofd) {
+        // Maximaal vierkant dat het hoofd kan bevatten, begrensd door de korte zijde.
+        $zijde     = min(max($zijde, $hoofd_h, $hoofd_w), $img_breed, $img_hoogte);
+        $crop_left = $hoofd_cx - (int) round($zijde / 2);
+        $crop_top  = $hoofd_cy - (int) round($zijde / 2);
+        $crop_left = max(0, min($crop_left, $img_breed  - $zijde));
+        $crop_top  = max(0, min($crop_top,  $img_hoogte - $zijde));
+        watchdog($extdebug, 'autocrop: hoofd-behoud actief — crop vergroot/verschoven naar @z² om heel hoofd te behouden voor @f',
+            ['@z' => $zijde, '@f' => $_bestandsnaam], WATCHDOG_INFO);
+    }
+
     // ------------------------------------------------------------------ 4. Crop + master normaliseren naar 2160²
     // Snijd het vierkant rond het gezicht én normaliseer de master in één pass naar
     // 2160×2160 — de grootste profielfoto-derivative. Grotere crops worden verkleind
