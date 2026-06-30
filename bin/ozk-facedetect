@@ -108,9 +108,10 @@ def _detect_cnn(img):
     return out
 
 
-# Vergelijkmodus (--all) draait alle drie naast elkaar (MediaPipe is verwijderd:
-# short-range model faalde op afstandsfoto's en is van de server gehaald).
-DETECTORS_ALL = [_detect_hog, _detect_yunet, _detect_cnn]
+# Vergelijkmodus (--all) draait HOG + YuNet — zelfde set als productie-PRIMARY.
+# CNN is hier uitgeschakeld: het voegt weinig toe aan de vergelijking (productie
+# gebruikt het alleen als laatste vangnet bij geen enkel resultaat) en kost ~9s extra.
+DETECTORS_ALL = [_detect_hog, _detect_yunet]
 
 # Productie-cascade:
 #   1. PRIMARY: YuNet + HOG parallel (snel, ~2-3s). YuNet is de betrouwbaarste
@@ -199,6 +200,35 @@ def _run_detectors(img, detectors):
     return resultaten
 
 
+def _zoek_orientatie_hog(img, min_px):
+    """Bepaal met de orientatie-SELECTIEVE HOG-detector welke rotatie de foto rechtop zet.
+
+    Achtergrond: sommige foto's zijn fysiek gedraaid maar dragen GEEN EXIF-orientatie
+    (bv. na app-export of HEIC→JPEG-conversie); sectie 0 in PHP ziet daar niets. YuNet
+    vindt een gezicht in élke stand (rotatie-invariant) en normaliseert bovendien zijn
+    landmarks, dus dáár kunnen we de stand niet uit aflezen. HOG (dlib) vindt daarentegen
+    UITSLUITEND rechtopstaande gezichten — de stand waarin HOG een plausibel gezicht
+    vindt, is dus de juiste. We draaien de (verkleinde) detectie-kopie 90/180/270° en
+    geven de graden terug die PHP moet toepassen (magick -rotate, kloksgewijs), of 0 als
+    HOG in geen enkele gedraaide stand iets vindt.
+    """
+    import cv2
+    klein, factor = _schaal_voor_detectie(img)
+    drempel = (min_px * factor) if factor < 1.0 else min_px
+    rotaties = [
+        (90,  cv2.ROTATE_90_CLOCKWISE),
+        (180, cv2.ROTATE_180),
+        (270, cv2.ROTATE_90_COUNTERCLOCKWISE),
+    ]
+    import numpy as np
+    for deg, vlag in rotaties:
+        gedraaid = np.ascontiguousarray(cv2.rotate(klein, vlag))
+        boxes = _detect_hog(gedraaid)
+        if any(max(b[1] - b[3], b[2] - b[0]) >= drempel for b in boxes):
+            return deg
+    return 0
+
+
 def _kies_beste(resultaten, min_px):
     """Filter op grootte en kies de door consensus bevestigde, grootste box."""
     kandidaten = []
@@ -255,6 +285,22 @@ def main():
 
     beste_info, plausibel = _kies_beste(resultaten, min_px)
 
+    # Orientatie-controle (niet in vergelijkmodus). HOG is orientatie-selectief, YuNet
+    # niet. Vond HOG upright GEEN plausibel gezicht, dan kan de foto gedraaid zijn zonder
+    # EXIF-tag (ook als YuNet wél iets vond — die vindt 'm in elke stand). Controleer dat
+    # met HOG in de andere standen; vinden we daar de juiste stand, dan onderdrukken we
+    # de (mogelijk scheve) box en laat PHP eerst roteren + opnieuw detecteren.
+    suggested_rotation = 0
+    if not alle_modus:
+        hog_upright = any(
+            max(b[1] - b[3], b[2] - b[0]) >= min_px
+            for b in resultaten.get("hog", {}).get("boxes", [])
+        )
+        if not hog_upright:
+            suggested_rotation = _zoek_orientatie_hog(img, min_px)
+            if suggested_rotation:
+                beste_info = None
+
     def _clamp(top, right, bottom, left):
         return (max(0, min(top, img_hoogte)), max(0, min(right, img_breedte)),
                 max(0, min(bottom, img_hoogte)), max(0, min(left, img_breedte)))
@@ -292,7 +338,8 @@ def main():
     if not beste_info:
         print(json.dumps({"found": False,
                           "img_width": img_breedte, "img_height": img_hoogte,
-                          "detectors_run": sorted(resultaten)}))
+                          "detectors_run": sorted(resultaten),
+                          "suggested_rotation": suggested_rotation}))
         sys.exit(0)
 
     beste, sup = beste_info

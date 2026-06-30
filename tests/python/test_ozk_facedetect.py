@@ -147,5 +147,26 @@ class SchaalTest(unittest.TestCase):
         self.assertEqual(klein.shape, img.shape)
 
 
+class OrientatieTest(unittest.TestCase):
+    """Oriëntatie-zoeker. De échte rotatie-herkenning op een gedraaide-zonder-EXIF
+    foto is een end-to-end gegeven (shell-test op portret90.jpg → suggested_rotation
+    270 → upright crop); hier toetsen we de pure randvoorwaarde: vindt HOG in geen
+    enkele stand een gezicht, dan komt er GEEN (verkeerde) rotatie uit."""
+
+    def setUp(self):
+        try:
+            import numpy  # noqa: F401
+            import cv2     # noqa: F401
+            import face_recognition  # noqa: F401
+        except ImportError:
+            self.skipTest("numpy/cv2/face_recognition niet beschikbaar")
+
+    def test_geen_gezicht_geeft_geen_rotatie(self):
+        import numpy as np
+        # Egale ruis zonder gezicht → HOG vindt in geen enkele stand iets → 0.
+        img = np.zeros((600, 400, 3), dtype=np.uint8)
+        self.assertEqual(fd._zoek_orientatie_hog(img, min_px=50), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

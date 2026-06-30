@@ -776,45 +776,75 @@ function _ozk_profielfoto_autocrop_op_pad($pad, $bestand = NULL) {
     // doorgegeven aan de detector (filtert false positives al in Python) én hergebruikt
     // door de plausibiliteitsguard hieronder (sectie 3a) als backstop.
     $min_face_ratio = 0.08;
-    $tmp_detect   = $pad . '.detect.jpg';
-    $img_info_pre = getimagesize($pad);
-    $schaal       = 1.0;
-    if ($img_info_pre && max($img_info_pre[0], $img_info_pre[1]) > 4320) {
-        exec('magick ' . escapeshellarg($pad . '[0]') . " -resize '4320x4320>' " . escapeshellarg($tmp_detect));
-        $tmp_info = getimagesize($tmp_detect);
-        if ($tmp_info) {
-            $schaal = $img_info_pre[0] / $tmp_info[0];
+    $_bestandsnaam  = $bestand ? $bestand->filename : basename($pad);
+
+    // Detectie met één retry. Vindt de detector upright geen gezicht maar wél na
+    // (virtueel) roteren, dan geeft ozk-facedetect 'suggested_rotation' terug. Zo
+    // ondervangen we foto's die fysiek gedraaid zijn maar GEEN EXIF-orientatie dragen
+    // (bv. na app-export of HEIC→JPEG-conversie): sectie 0 ziet daar niets, de detector
+    // wél. We bakken die rotatie dan in (net als EXIF) en detecteren één keer opnieuw
+    // op de nu rechtopstaande foto, zodat de coördinaten gewoon kloppen.
+    $gezicht     = NULL;
+    $gezicht_raw = NULL;
+    $schaal      = 1.0;
+    for ($poging = 0; $poging <= 1; $poging++) {
+        $tmp_detect   = $pad . '.detect.jpg';
+        $img_info_pre = getimagesize($pad);
+        $schaal       = 1.0;
+        // Detectie op origineel of max 4320px (2×2160) zodat kleine gezichten goed
+        // gevonden worden. Alleen verkleinen als bron groter is dan 4320px.
+        if ($img_info_pre && max($img_info_pre[0], $img_info_pre[1]) > 4320) {
+            exec('magick ' . escapeshellarg($pad . '[0]') . " -resize '4320x4320>' " . escapeshellarg($tmp_detect));
+            $tmp_info = getimagesize($tmp_detect);
+            if ($tmp_info) {
+                $schaal = $img_info_pre[0] / $tmp_info[0];
+            }
+            $detect_pad = $tmp_detect;
+        } else {
+            $detect_pad = $pad;
         }
-        $detect_pad = $tmp_detect;
-    } else {
-        $detect_pad = $pad;
-    }
-    $t_stap = $_t('1. pre-shrink (orig ' . ($img_info_pre[0] ?? '?') . 'x' . ($img_info_pre[1] ?? '?') . ' → ' . basename($detect_pad) . ')', $t_stap);
+        $t_stap = $_t('1. pre-shrink (orig ' . ($img_info_pre[0] ?? '?') . 'x' . ($img_info_pre[1] ?? '?') . ' → ' . basename($detect_pad) . ', poging ' . $poging . ')', $t_stap);
 
-    // De detector draait meerdere engines parallel (HOG + YuNet + evt. MediaPipe) en
-    // geeft het beste, door consensus bevestigde gezicht terug; te kleine kandidaten
-    // (false positives) worden binnen het script al weggefilterd op $min_face_ratio.
-    $cmd_detect = escapeshellarg($script) . ' ' . escapeshellarg($detect_pad) . ' ' . escapeshellarg((string) $min_face_ratio);
-    $json_raw   = shell_exec($cmd_detect);
-    $t_stap = $_t('2. facedetect (HOG+YuNet)', $t_stap);
+        // De detector draait meerdere engines parallel (HOG + YuNet) en geeft het beste,
+        // door consensus bevestigde gezicht terug; te kleine kandidaten (false positives)
+        // worden binnen het script al weggefilterd op $min_face_ratio.
+        $cmd_detect = escapeshellarg($script) . ' ' . escapeshellarg($detect_pad) . ' ' . escapeshellarg((string) $min_face_ratio);
+        $json_raw   = shell_exec($cmd_detect);
+        $t_stap = $_t('2. facedetect (HOG+YuNet)', $t_stap);
 
-    if (isset($tmp_detect) && file_exists($tmp_detect)) {
-        @unlink($tmp_detect);
-    }
-    $gezicht_raw = $json_raw ? json_decode($json_raw, TRUE) : NULL;
-    // Coördinaten terugschalen naar originele afmetingen
-    $gezicht = $gezicht_raw;
-    if (!empty($gezicht_raw['found']) && $schaal > 1.0) {
-        $gezicht = [
-            'found'  => TRUE,
-            'top'    => (int) round($gezicht_raw['top']    * $schaal),
-            'right'  => (int) round($gezicht_raw['right']  * $schaal),
-            'bottom' => (int) round($gezicht_raw['bottom'] * $schaal),
-            'left'   => (int) round($gezicht_raw['left']   * $schaal),
-        ];
-    }
+        if (file_exists($tmp_detect)) {
+            @unlink($tmp_detect);
+        }
+        $gezicht_raw = $json_raw ? json_decode($json_raw, TRUE) : NULL;
 
-    $_bestandsnaam = $bestand ? $bestand->filename : basename($pad);
+        // Coördinaten terugschalen naar originele afmetingen
+        $gezicht = $gezicht_raw;
+        if (!empty($gezicht_raw['found']) && $schaal > 1.0) {
+            $gezicht = [
+                'found'  => TRUE,
+                'top'    => (int) round($gezicht_raw['top']    * $schaal),
+                'right'  => (int) round($gezicht_raw['right']  * $schaal),
+                'bottom' => (int) round($gezicht_raw['bottom'] * $schaal),
+                'left'   => (int) round($gezicht_raw['left']   * $schaal),
+            ];
+        }
+
+        // Gevonden → klaar. Anders: als de detector een rotatie voorstelt, die in de
+        // eerste poging inbakken en opnieuw detecteren op de rechtopstaande foto.
+        if (!empty($gezicht['found'])) {
+            break;
+        }
+        $rot = !empty($gezicht_raw['suggested_rotation']) ? (int) $gezicht_raw['suggested_rotation'] : 0;
+        if ($poging === 0 && in_array($rot, [90, 180, 270], TRUE)) {
+            exec('magick ' . escapeshellarg($pad . '[0]') . ' -rotate ' . $rot . ' +repage -quality 95 ' . escapeshellarg($pad), $ur, $rvr);
+            watchdog($extdebug, 'autocrop: geen EXIF maar detector stelt @d° rotatie voor → ingebakken voor @f', ['@d' => $rot, '@f' => $_bestandsnaam], WATCHDOG_INFO);
+            if ($bestand) {
+                $bestand->filesize = filesize($pad);
+            }
+            continue;
+        }
+        break;
+    }
 
     if (empty($gezicht['found'])) {
         // Geen gezicht gevonden → foto ONAANGEROERD laten (volledige foto bewaren).
