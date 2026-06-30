@@ -842,10 +842,11 @@ function _ozk_profielfoto_autocrop_op_pad($pad, $bestand = NULL) {
     // De grootste profielfoto-derivative is 2160px (square_profielfoto); niets heeft
     // meer nodig. Een 24MP-upload (6000×4000) door de hele pijplijn slepen is dus
     // verspilling: trage detectie/vergelijk én een onnodig grote master. We cappen
-    // het werkbestand hier op 3240px langste zijde — de korte zijde blijft dan ~2160,
-    // genoeg voor een scherpe 2160-crop, terwijl detectie toch op ≤1600 (DETECT_MAX)
-    // draait. Alleen verkleinen als de bron groter is (nooit upscalen).
-    $WERK_MAX = 3240;
+    // het werkbestand hier op 3840px langste zijde — de korte zijde blijft dan ~2560,
+    // ruim genoeg voor een scherpe 2160-crop (ook bij wijdere opnames), terwijl
+    // detectie toch op ≤1600 (DETECT_MAX) draait en de master sowieso op 2160² wordt
+    // gecapt (geen extra opslag). Alleen verkleinen als de bron groter is (nooit upscalen).
+    $WERK_MAX = 3840;
     $img_info_cap = getimagesize($pad);
     if ($img_info_cap && max($img_info_cap[0], $img_info_cap[1]) > $WERK_MAX) {
         exec('magick ' . escapeshellarg($pad . '[0]') . " -resize '{$WERK_MAX}x{$WERK_MAX}>' +repage -quality 92 " . escapeshellarg($pad), $uc, $rvc);
