@@ -451,7 +451,7 @@ function _ozk_profielfoto_verwerk_na_move($dst_uri, $contact_id, $upload_bron) {
             'contactId'         => $contact_id,
             'toEmail'           => 'webteam@onvergetelijk.nl',
             'toName'            => 'Webteam OZK',
-            'from'              => 'OZK <info@onvergetelijk.nl>',
+            'from'              => 'Onvergetelijke Zomerkampen <info@onvergetelijk.nl>',
             'tplParams'         => $tpl_params,
         ]);
         wachthond($extdebug, 3, 'mail 669 webteam verzonden', $contact_id);
@@ -471,7 +471,7 @@ function _ozk_profielfoto_verwerk_na_move($dst_uri, $contact_id, $upload_bron) {
                 'messageTemplateID' => 608,
                 'contactId'         => $contact_id,
                 'toEmail'           => $_to_email,
-                'from'              => 'OZK <info@onvergetelijk.nl>',
+                'from'              => 'Onvergetelijke Zomerkampen <info@onvergetelijk.nl>',
                 'tplParams'         => $tpl_params,
             ]);
             wachthond($extdebug, 3, 'mail 608 indiener verzonden', $_to_email);
