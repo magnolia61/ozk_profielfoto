@@ -18,6 +18,7 @@ function ozk_profielfoto_entity_insert($entity, $type) {
     }
     _ozk_profielfoto_plan_achtergrond([
         'uid'         => $entity->uid,
+        'contact_id'  => _ozk_profielfoto_resolve_contact_id($entity->uid),
         'fid'         => (int) $bestand->fid,
         'drupal_uri'  => $bestand->uri,
         'upload_bron' => 'entityform',
@@ -42,10 +43,24 @@ function ozk_profielfoto_entity_update($entity, $type) {
     }
     _ozk_profielfoto_plan_achtergrond([
         'uid'         => $entity->uid,
+        'contact_id'  => _ozk_profielfoto_resolve_contact_id($entity->uid),
         'fid'         => (int) $bestand->fid,
         'drupal_uri'  => $bestand->uri,
         'upload_bron' => 'entityform',
     ]);
+}
+
+/**
+ * Lost het CiviCRM contact_id op uit een Drupal UID, ín de hoofdrequest waar
+ * CiviCRM gegarandeerd actief is. Geeft NULL terug als het niet lukt; de shutdown
+ * valt dan terug op een eigen lookup.
+ */
+function _ozk_profielfoto_resolve_contact_id($uid) {
+    if (!$uid || !civicrm_initialize()) {
+        return NULL;
+    }
+    $cid = CRM_Core_BAO_UFMatch::getContactId($uid);
+    return $cid ? (int) $cid : NULL;
 }
 
 /**
@@ -89,8 +104,16 @@ function _ozk_profielfoto_webform_achtergrond_plannen($node, $submission) {
         watchdog('ozk_profielfoto', 'webform 608: file_load(@fid) mislukt', ['@fid' => $fid], WATCHDOG_WARNING);
         return;
     }
+    // Het contact_id zit al in de submission (CiviCRM-webform-integratie). Pak het
+    // hier op zodat de shutdown geen UFMatch-lookup meer hoeft te doen. Belangrijk:
+    // bij de anonieme checksumlink-route is $submission->uid = 0, dus een
+    // getContactId($uid) in de shutdown zou daar niets vinden.
+    $contact_id = !empty($submission->civicrm['contact'][1]['id'])
+        ? (int) $submission->civicrm['contact'][1]['id']
+        : NULL;
     _ozk_profielfoto_plan_achtergrond([
         'uid'         => $submission->uid,
+        'contact_id'  => $contact_id,
         'fid'         => $fid,
         'drupal_uri'  => $bestand->uri,
         'upload_bron' => 'webform',
@@ -104,7 +127,7 @@ function _ozk_profielfoto_webform_achtergrond_plannen($node, $submission) {
  * fastcgi_finish_request() sluit de HTTP-verbinding; PHP-FPM draait daarna door.
  * Zonder die functie (mod_php) valt het terug op synchrone uitvoering in de shutdown.
  *
- * @param array $params  ['uid', 'fid', 'drupal_uri', 'upload_bron']
+ * @param array $params  ['uid', 'contact_id', 'fid', 'drupal_uri', 'upload_bron']
  */
 function _ozk_profielfoto_plan_achtergrond(array $params) {
     // Voorkom dubbele registratie als zowel insert als update vuren (Drupal-edge case).
@@ -135,7 +158,7 @@ function _ozk_profielfoto_plan_achtergrond(array $params) {
  * Dat is niet meer nodig: webform component 7 staat op scheme=public, bestanden
  * landen direct in public://profielfotos/.
  *
- * @param array $params  ['uid', 'fid', 'drupal_uri', 'upload_bron']
+ * @param array $params  ['uid', 'contact_id', 'fid', 'drupal_uri', 'upload_bron']
  */
 function _ozk_profielfoto_verwerk_achtergrond(array $params) {
     $extdebug  = 'ozk_profielfoto';
@@ -149,6 +172,7 @@ function _ozk_profielfoto_verwerk_achtergrond(array $params) {
     };
 
     $uid         = $params['uid'];
+    $contact_id  = !empty($params['contact_id']) ? (int) $params['contact_id'] : NULL;
     $fid         = $params['fid'];
     $drupal_uri  = $params['drupal_uri'];
     $upload_bron = $params['upload_bron'];
@@ -186,9 +210,15 @@ function _ozk_profielfoto_verwerk_achtergrond(array $params) {
         watchdog($extdebug, 'achtergrond: civicrm_initialize mislukt — stop.', [], WATCHDOG_ERROR);
         return;
     }
-    $contact_id = CRM_Core_BAO_UFMatch::getContactId($uid);
+    // Het contact_id is in de hoofdrequest al opgelost en meegegeven. Alleen als
+    // dat (bij uitzondering) niet lukte, vallen we hier terug op een UFMatch-lookup
+    // — die faalt voor de anonieme checksumlink-route (uid=0), vandaar de voorkeur
+    // voor de meegegeven waarde.
     if (!$contact_id) {
-        watchdog($extdebug, 'achtergrond: geen contact_id voor UID @u — stop.', ['@u' => $uid], WATCHDOG_ERROR);
+        $contact_id = CRM_Core_BAO_UFMatch::getContactId($uid);
+    }
+    if (!$contact_id) {
+        watchdog($extdebug, 'achtergrond: geen contact_id (uid=@u, niet meegegeven) — stop.', ['@u' => $uid], WATCHDOG_ERROR);
         return;
     }
     $image_url = file_create_url($drupal_uri);
