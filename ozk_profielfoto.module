@@ -70,9 +70,18 @@ function _ozk_profielfoto_webform_achtergrond_plannen($node, $submission) {
     if ($node->nid != 608) {
         return;
     }
-    $fid = !empty($submission->data[7][0]) ? (int) $submission->data[7][0] : 0;
+    // Zoek de cid op via form_key zodat de code niet breekt als het component
+    // ooit opnieuw wordt aangemaakt en een ander auto-increment cid krijgt.
+    $cid = NULL;
+    foreach ($node->webform['components'] as $component) {
+        if ($component['form_key'] === 'civicrm_1_contact_1_contact_image_URL') {
+            $cid = (int) $component['cid'];
+            break;
+        }
+    }
+    $fid = ($cid && !empty($submission->data[$cid][0])) ? (int) $submission->data[$cid][0] : 0;
     if (!$fid) {
-        watchdog('ozk_profielfoto', 'webform 608: geen fid in submission data[7]', [], WATCHDOG_WARNING);
+        watchdog('ozk_profielfoto', 'webform 608: geen fid gevonden (form_key civicrm_1_contact_1_contact_image_URL, cid=@cid)', ['@cid' => $cid ?? '?'], WATCHDOG_WARNING);
         return;
     }
     $bestand = file_load($fid);
