@@ -205,6 +205,28 @@ function _ozk_profielfoto_verwerk_achtergrond(array $params) {
     }
     $t_stap = $_tp('1. file_load + realpath', $t_stap);
 
+    // ── 1b. Locatie normaliseren naar public://profielfotos/ ──────────────────
+    // De webform-filecomponent slaat op in public://webform/profielfotos/ (met een
+    // 'webform/'-submap). Álle mailtemplates en image-styles gaan echter uit van
+    // public://profielfotos/ (net als de entityform-route): ze bouwen de derivative-
+    // URL als styles/<stijl>/public/profielfotos/<basename>. Zonder normalisatie staan
+    // de derivatives in .../public/webform/profielfotos/... en wijzen de mail-URL's naar
+    // .../public/profielfotos/... → 404 / kapotte foto in o.a. de 608-mail. We
+    // verplaatsen het bestand daarom naar de canonieke map (entityform staat er al).
+    if (strpos($bestand->uri, 'public://profielfotos/') !== 0) {
+        $doel_dir = 'public://profielfotos';
+        if (file_prepare_directory($doel_dir, FILE_CREATE_DIRECTORY)) {
+            $verplaatst = file_move($bestand, $doel_dir . '/' . drupal_basename($bestand->uri), FILE_EXISTS_RENAME);
+            if ($verplaatst) {
+                $bestand    = $verplaatst;
+                $drupal_uri = $bestand->uri;
+                $pad        = drupal_realpath($bestand->uri);
+                watchdog($extdebug, 'achtergrond: bestand genormaliseerd naar @u', ['@u' => $drupal_uri], WATCHDOG_INFO);
+            }
+        }
+    }
+    $t_stap = $_tp('1b. normaliseer naar public://profielfotos', $t_stap);
+
     // ── 2. Contact.update image_URL ──────────────────────────────────────────
     if (!civicrm_initialize()) {
         watchdog($extdebug, 'achtergrond: civicrm_initialize mislukt — stop.', [], WATCHDOG_ERROR);
