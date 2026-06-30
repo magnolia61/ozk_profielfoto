@@ -41,6 +41,11 @@ function _ozk_profielfoto_vergelijk_varianten($origineel_pad, $opts = array()) {
         if (!$contact_id && $uid && civicrm_initialize()) {
             $contact_id = CRM_Core_BAO_UFMatch::getContactId($uid);
         }
+        // Fallback: extraheer contact_id uit de OZK-bestandsnaam ([naam]_[cid]_[datum]).
+        // Vangt gevallen op waarbij de UID niet in uf_match staat (drush, webteam-upload).
+        if (!$contact_id && preg_match('/_(\d+)_\d{8}_\d{4}\./', basename($bron), $_m)) {
+            $contact_id = (int) $_m[1];
+        }
         $idstr = $contact_id ? ('cid' . $contact_id) : ($uid ? ('uid' . $uid) : 'x');
 
         $stamp   = date('Ymd_His');
@@ -70,80 +75,93 @@ function _ozk_profielfoto_vergelijk_varianten($origineel_pad, $opts = array()) {
         $W = (int) $data['img_width'];
         $H = (int) $data['img_height'];
 
-        // 2. Cellen bouwen — ÉÉN RIJ PER METHODE, 4 cellen per rij:
-        //    [box-overlay] [crop 2.0×] [crop 2.5×] [crop 3.0×]  (centrum 42%).
-        //    Met -tile 4x levert dat per detector precies één regel op. Een detector
-        //    die niets vond krijgt een placeholder + 3 lege cellen zodat het raster
-        //    netjes uitgelijnd blijft. Het origineel staat NIET in het grid maar
-        //    bovenaan de mail naast de tabel.
+        // 2. Productie-crop genereren — zelfde adaptieve logica als autocrop_op_pad.
+        //    Gebruik $data['best'] (de winnaar na consensus over alle detectoren).
+        $best_box   = $data['best'] ?? NULL;
+        $prod_url   = NULL;
+        $prod_label = 'geen gezicht gevonden';
+        if ($best_box) {
+            $bw       = $best_box['right'] - $best_box['left'];
+            $bh       = $best_box['bottom'] - $best_box['top'];
+            $gz_max   = max($bw, $bh);
+            // Adaptief: gezicht = 35% van de crop-hoogte (zelfde als productie).
+            $zijde    = (int) round($gz_max / 0.35);
+            $zijde    = max($zijde, (int) round($gz_max * 1.5), 100);
+            $zijde    = min($zijde, $W, $H);
+            $cx       = (int) round(($best_box['left'] + $best_box['right'])  / 2);
+            $cy       = (int) round(($best_box['top']  + $best_box['bottom']) / 2);
+            $crop_top = max(0, min($cy - (int) round($zijde * 0.42), $H - $zijde));
+            $crop_lft = max(0, min($cx - (int) round($zijde / 2),    $W - $zijde));
+            $geom     = ['zijde' => $zijde, 'left' => $crop_lft, 'top' => $crop_top];
+
+            $prod_pad    = _ozk_vgl_crop($werkmap, $bron, $geom, 'prod');
+            $_prod_pubdir = 'public://profielfoto-vergelijk';
+            file_prepare_directory($_prod_pubdir, FILE_CREATE_DIRECTORY);
+            $prod_uri = $_prod_pubdir . '/prod_' . $idstr . '_' . $stamp . '.jpg';
+            $prod_new = file_unmanaged_copy($prod_pad, $prod_uri, FILE_EXISTS_REPLACE);
+            $prod_url = $prod_new ? file_create_url($prod_new) : NULL;
+            $prod_label = sprintf('productie-crop · %s · score %.2f · gezicht %d%%',
+                strtoupper($best_box['detector'] ?? '?'),
+                $best_box['score'] ?? 0,
+                (int) round($gz_max / $zijde * 100));
+        }
+
+        // 3. Naar publieke map + origineel met ECHTE proporties (geen vierkant forceren).
+        $pubdir = 'public://profielfoto-vergelijk';
+        file_prepare_directory($pubdir, FILE_CREATE_DIRECTORY);
+
+        // Origineel op ware verhouding — max 400px op langste zijde, geen crop.
+        $orig_pad = $werkmap . '/orig_prop.jpg';
+        exec('magick ' . escapeshellarg($bron . '[0]') . ' -resize 400x400 ' . escapeshellarg($orig_pad));
+        $orig_uri = $pubdir . '/orig_' . $idstr . '_' . $stamp . '.jpg';
+        $orig_new = file_unmanaged_copy($orig_pad, $orig_uri, FILE_EXISTS_REPLACE);
+        $orig_url = $orig_new ? file_create_url($orig_new) : NULL;
+
+        // 4. Montage: 4 kolommen per detector (box-overlay + crop 2.0/2.5/3.0).
         $cellen           = [];
         $padding_kolommen = [2.0, 2.5, 3.0];
-
         foreach ($data['detectors'] as $det) {
             $naam = strtoupper($det['name']);
             $box  = $det['largest'];
-
             if (!$box) {
                 $reden = !empty($det['error']) ? 'overgeslagen' : 'geen gezicht';
-                $cellen[] = ['path' => _ozk_vgl_leeg($werkmap, $det['name']), 'label' => sprintf('%s — %s', $naam, $reden)];
+                $cellen[] = ['path' => _ozk_vgl_leeg($werkmap, $det['name']),        'label' => "$naam — $reden"];
                 for ($i = 0; $i < 3; $i++) {
-                    $cellen[] = ['path' => _ozk_vgl_leeg($werkmap, $det['name'] . '_pad' . $i), 'label' => ''];
+                    $cellen[] = ['path' => _ozk_vgl_leeg($werkmap, $det['name'] . "_p$i"), 'label' => ''];
                 }
                 continue;
             }
-
-            // Kolom 1: volledige foto met de gevonden box.
             $cellen[] = [
                 'path'  => _ozk_vgl_overlay($werkmap, $bron, $box, $W, $det['name'] . '_box'),
-                'label' => sprintf('%s  %.2f  ·  box', $naam, $box['score']),
+                'label' => sprintf('%s  %.2f  box', $naam, $box['score']),
             ];
-            // Kolom 2-4: de crop bij drie paddings (centrum 42%).
             foreach ($padding_kolommen as $padding) {
                 $g   = _ozk_vgl_geom($box, $padding, 0.42, $W, $H);
                 $key = sprintf('%s_p%02d', $det['name'], (int) round($padding * 10));
                 $cellen[] = [
                     'path'  => _ozk_vgl_crop($werkmap, $bron, $g, $key),
-                    'label' => sprintf('%s  ·  crop %.1f×', $naam, $padding),
+                    'label' => sprintf('%s  %.1f×', $naam, $padding),
                 ];
             }
         }
-
-        // 3. Montage samenstellen (montage zet de labels netjes onder elke tegel).
-        $montage = $werkmap . '/montage.jpg';
-        $cmd = 'magick montage';
+        $montage    = $werkmap . '/montage.jpg';
+        $cmd_montage = 'magick montage';
         foreach ($cellen as $c) {
-            if (empty($c['path']) || !is_file($c['path'])) {
-                continue;
+            if (!empty($c['path']) && is_file($c['path'])) {
+                $cmd_montage .= ' -label ' . escapeshellarg($c['label']) . ' ' . escapeshellarg($c['path']);
             }
-            $cmd .= ' -label ' . escapeshellarg($c['label']) . ' ' . escapeshellarg($c['path']);
         }
-        // Duidelijke, schreefloze labels: groot, vet, zwart op wit. DejaVu-Sans-Bold is
-        // op deze server beschikbaar (anders valt montage terug op de standaard).
-        $titel = 'OZK foto-autocrop vergelijking — ' . $stamp;
-        $cmd .= ' -font DejaVu-Sans-Bold -pointsize 19 -tile 4x -geometry 380x380+14+16'
-              . ' -background white -fill black -title ' . escapeshellarg($titel)
-              . ' ' . escapeshellarg($montage);
-        exec($cmd, $uit, $rv);
-        if ($rv !== 0 || !is_file($montage)) {
-            watchdog('ozk_profielfoto', 'vergelijk: montage mislukt (rv=@r)', ['@r' => $rv], WATCHDOG_WARNING);
-            return;
-        }
+        $cmd_montage .= ' -font DejaVu-Sans-Bold -pointsize 19 -tile 4x -geometry 320x320+10+12'
+                     . ' -background white -fill black ' . escapeshellarg($montage);
+        exec($cmd_montage, $uit_m, $rv_m);
+        $montage_uri = $pubdir . '/vgl_' . $idstr . '_' . $stamp . '.jpg';
+        $montage_new = ($rv_m === 0 && is_file($montage))
+            ? file_unmanaged_copy($montage, $montage_uri, FILE_EXISTS_REPLACE) : NULL;
+        $montage_url = $montage_new ? file_create_url($montage_new) : NULL;
 
-        // 4. Naar publieke map (zodat <img> in de mail rendert) + opruimen werkmap.
-        $pubdir = 'public://profielfoto-vergelijk';
-        file_prepare_directory($pubdir, FILE_CREATE_DIRECTORY);
-        $puburi = $pubdir . '/vgl_' . $idstr . '_' . $stamp . '.jpg';
-        $nieuw  = file_unmanaged_copy($montage, $puburi, FILE_EXISTS_REPLACE);
-        $url    = $nieuw ? file_create_url($nieuw) : NULL;
-
-        // Los origineel-thumbnail voor bovenin de mail (naast de tabel).
-        $orig_cel = _ozk_vgl_origineel($werkmap, $bron, 'mailorig');
-        $orig_uri = $pubdir . '/orig_' . $idstr . '_' . $stamp . '.jpg';
-        $orig_new = file_unmanaged_copy($orig_cel, $orig_uri, FILE_EXISTS_REPLACE);
-        $orig_url = $orig_new ? file_create_url($orig_new) : NULL;
-
-        // 5. Naam + tekst-tabel met de ruwe cijfers, dan mailen.
-        $naamstr = '';
+        // 5. Naam (+ DITJAAR kampkort) + tekst-tabel met de ruwe cijfers, dan mailen.
+        $naamstr  = '';
+        $kampkort = '';
         if ($contact_id && civicrm_initialize()) {
             try {
                 $r = civicrm_api4('Contact', 'get', [
@@ -156,7 +174,16 @@ function _ozk_profielfoto_vergelijk_varianten($origineel_pad, $opts = array()) {
             catch (Exception $e) {
                 // naam optioneel
             }
+            // DITJAAR kampkort (bv. 'TK2') uit de inschrijving van dit jaar, als die er is.
+            // Zelfde bron als verwerk_na_move; route-onafhankelijk via base_find_allpart.
+            if (function_exists('base_find_allpart')) {
+                $allpart  = base_find_allpart($contact_id);
+                $kampkort = ($allpart && !empty($allpart['result_allpart_one_kampkort']))
+                    ? $allpart['result_allpart_one_kampkort'] : '';
+            }
         }
+        // Weergavetitel: "Naam (TK2)" als kampkort bekend is, anders alleen naam/id.
+        $titelstr = ($naamstr ?: $idstr) . ($kampkort ? ' (' . $kampkort . ')' : '');
 
         $rijen = '';
         foreach ($data['detectors'] as $det) {
@@ -173,13 +200,7 @@ function _ozk_profielfoto_vergelijk_varianten($origineel_pad, $opts = array()) {
                . '<tr style="background:#f0f0f0"><th align="left">detector</th><th align="left">tijd</th><th align="left">gevonden</th></tr>'
                . $rijen . '</table>';
 
-        $orig_html = $orig_url
-            ? '<img src="' . $orig_url . '" style="display:block;max-width:320px;border:1px solid #ddd">'
-              . '<div style="font-size:12px;color:#888;margin-top:4px">origineel ' . $W . '×' . $H . '</div>'
-            : '';
-
-        // Upload-links onderaan, mét geldige CiviCRM-checksum voor déze contact, zodat
-        // de ontvanger direct (zonder inloggen) een nieuwe foto kan uploaden ter test.
+        // Upload-links onderaan, mét geldige CiviCRM-checksum voor déze contact.
         $links_html = '';
         if ($contact_id && civicrm_initialize()) {
             $cs     = CRM_Contact_BAO_Contact_Utils::generateChecksum($contact_id);
@@ -193,30 +214,47 @@ function _ozk_profielfoto_vergelijk_varianten($origineel_pad, $opts = array()) {
               . '</ol>';
         }
 
-        // Bovenin: tabel links, origineel rechts (layout-tabel = betrouwbaar in mailclients).
-        $html = '<p>Vergelijking foto-autocrop voor <b>' . htmlspecialchars($naamstr ?: $idstr) . '</b> — ' . $stamp . '</p>'
-              . '<table cellpadding="0" cellspacing="0"><tr>'
-              . '<td valign="top">' . $tabel . '</td>'
-              . '<td valign="top" style="padding-left:24px">' . $orig_html . '</td>'
-              . '</tr></table>'
-              . ($url ? '<p style="margin-top:16px"><img src="' . $url . '" style="max-width:100%;border:1px solid #ddd"></p>' : '<p>(montage niet beschikbaar)</p>')
+        // Twee foto's naast elkaar: origineel links, productie-crop rechts.
+        $fotos_html = '<table cellpadding="0" cellspacing="0" style="margin-top:16px"><tr>'
+            . '<td valign="top" style="padding-right:24px">'
+            . ($orig_url
+                ? '<img src="' . $orig_url . '" style="display:block;max-width:320px;border:1px solid #ddd">'
+                  . '<div style="font-size:12px;color:#888;margin-top:4px">origineel ' . $W . '×' . $H . '</div>'
+                : '<i>(origineel niet beschikbaar)</i>')
+            . '</td>'
+            . '<td valign="top">'
+            . ($prod_url
+                ? '<img src="' . $prod_url . '" style="display:block;max-width:320px;border:1px solid #ddd">'
+                  . '<div style="font-size:12px;color:#888;margin-top:4px">' . htmlspecialchars($prod_label) . '</div>'
+                : '<i>' . htmlspecialchars($prod_label) . '</i>')
+            . '</td>'
+            . '</tr></table>';
+
+        $montage_html = $montage_url
+            ? '<p style="margin-top:20px"><img src="' . $montage_url . '" style="max-width:100%;border:1px solid #ddd"></p>'
+            : '<p style="color:#c00">(montage niet beschikbaar)</p>';
+
+        $html = '<p>Vergelijking foto-autocrop voor <b>' . htmlspecialchars($titelstr) . '</b> — ' . $stamp . '</p>'
+              . $tabel
+              . $fotos_html
+              . $montage_html
               . $links_html
               . '<p style="color:#888;font-size:12px">Tijdelijke vergelijkmodus. Uitzetten: <code>drush vdel ozk_profielfoto_vergelijk</code></p>';
 
         if (civicrm_initialize()) {
             // CRM_Utils_Mail::send() neemt $params by reference → eerst in een variabele.
             $mailparams = [
-                'from'    => 'OZK <info@onvergetelijk.nl>',
+                'from'    => 'Onvergetelijke Zomerkampen <info@onvergetelijk.nl>',
                 'toEmail' => 'webteam@onvergetelijk.nl',
                 'toName'  => 'Webteam OZK',
-                'subject' => '[VERGELIJK] foto-autocrop ' . ($naamstr ?: $idstr) . ' ' . $stamp,
+                'subject' => '[VERGELIJK] foto-autocrop ' . $titelstr . ' ' . $stamp,
                 'html'    => $html,
             ];
             CRM_Utils_Mail::send($mailparams);
         }
 
-        watchdog('ozk_profielfoto', 'vergelijk-montage gemaild voor uid @u (@n cellen): @url',
-            ['@u' => $idstr, '@n' => count($cellen), '@url' => $url], WATCHDOG_INFO);
+        watchdog('ozk_profielfoto', 'vergelijk gemaild voor @u: orig=@o prod=@p montage=@m',
+            ['@u' => $idstr, '@o' => $orig_url ?: '(geen)', '@p' => $prod_url ?: '(geen)', '@m' => $montage_url ?: '(geen)'], WATCHDOG_INFO);
 
         // Werkmap opruimen (montage staat al in public://).
         if (function_exists('file_unmanaged_delete_recursive')) {
