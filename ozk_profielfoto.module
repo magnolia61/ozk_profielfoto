@@ -838,6 +838,25 @@ function _ozk_profielfoto_autocrop_op_pad($pad, $bestand = NULL) {
     }
     $t_stap = $_t('0. EXIF-orientatie', $t_stap);
 
+    // ------------------------------------------------------------------ 0a. Werkbestand cappen
+    // De grootste profielfoto-derivative is 2160px (square_profielfoto); niets heeft
+    // meer nodig. Een 24MP-upload (6000×4000) door de hele pijplijn slepen is dus
+    // verspilling: trage detectie/vergelijk én een onnodig grote master. We cappen
+    // het werkbestand hier op 3240px langste zijde — de korte zijde blijft dan ~2160,
+    // genoeg voor een scherpe 2160-crop, terwijl detectie toch op ≤1600 (DETECT_MAX)
+    // draait. Alleen verkleinen als de bron groter is (nooit upscalen).
+    $WERK_MAX = 3240;
+    $img_info_cap = getimagesize($pad);
+    if ($img_info_cap && max($img_info_cap[0], $img_info_cap[1]) > $WERK_MAX) {
+        exec('magick ' . escapeshellarg($pad . '[0]') . " -resize '{$WERK_MAX}x{$WERK_MAX}>' +repage -quality 92 " . escapeshellarg($pad), $uc, $rvc);
+        watchdog($extdebug, 'autocrop: werkbestand gecapt @oud → ≤@max px voor @f',
+            ['@oud' => $img_info_cap[0] . 'x' . $img_info_cap[1], '@max' => $WERK_MAX, '@f' => basename($pad)], WATCHDOG_INFO);
+        if ($bestand) {
+            $bestand->filesize = filesize($pad);
+        }
+    }
+    $t_stap = $_t('0a. werkbestand cappen (≤' . $WERK_MAX . 'px)', $t_stap);
+
     // ------------------------------------------------------------------ 1. Gezicht detecteren
     // Detectie op origineel of max 4320px (2×2160) zodat kleine gezichten goed gevonden
     // worden. Alleen verkleinen als bron groter is dan 4320px (zelden bij normale uploads).
@@ -991,19 +1010,21 @@ function _ozk_profielfoto_autocrop_op_pad($pad, $bestand = NULL) {
     $crop_top  = max(0, min($crop_top,  $img_hoogte - $zijde));
     $zijde     = min($zijde, $img_breed, $img_hoogte);
 
-    // ------------------------------------------------------------------ 4. Crop met ImageMagick (géén resize hier)
-    // Bronbestand blijft op originele resolutie; _ozk_profielfoto_push_image_url_naar_civicrm
-    // schaalt daarna op naar ≥2160px. Kleine derivatives (square_0260 etc.) worden via
-    // image_style_create_derivative gemaakt — die zorgen zelf voor de juiste uitvoergrootte.
+    // ------------------------------------------------------------------ 4. Crop + master normaliseren naar 2160²
+    // Snijd het vierkant rond het gezicht én normaliseer de master in één pass naar
+    // 2160×2160 — de grootste profielfoto-derivative. Grotere crops worden verkleind
+    // (scherp), kleinere opgeschaald (zoals voorheen via de aparte upscale-stap). Zo is
+    // de master altijd precies groot genoeg, nooit groter. Het vierkant maakt -resize
+    // 2160x2160 deterministisch 2160².
     $geometry = sprintf('%dx%d+%d+%d', $zijde, $zijde, $crop_left, $crop_top);
     $cmd_crop = sprintf(
-        'magick %s -crop %s +repage -auto-orient -quality 92 %s',
+        'magick %s -crop %s +repage -resize 2160x2160 -auto-orient -quality 92 %s',
         escapeshellarg($pad . '[0]'),
         escapeshellarg($geometry),
         escapeshellarg($pad)
     );
     exec($cmd_crop, $uitvoer, $rv);
-    $t_stap = $_t('3. ImageMagick crop', $t_stap);
+    $t_stap = $_t('3. ImageMagick crop + resize 2160', $t_stap);
 
     if ($rv !== 0) {
         watchdog($extdebug, 'autocrop: ImageMagick crop mislukt (rv=@rv) voor @f', ['@rv' => $rv, '@f' => $_bestandsnaam], WATCHDOG_ERROR);
