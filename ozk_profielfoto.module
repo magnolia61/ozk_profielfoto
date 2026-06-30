@@ -514,16 +514,23 @@ function _ozk_profielfoto_verwerk_na_move($dst_uri, $contact_id, $upload_bron) {
     );
     wachthond($extdebug, 3, 'mail 608 toEmail', $_to_email ?: '(geen)');
 
-    // 608 gaat ALLEEN naar de deelnemer/ouder als dit een ECHTE nieuwe foto is:
-    // de hash van de ruwe upload verschilt van die van de vorige verzonden foto.
-    // Zo geen 608 bij re-processing (jaaroverzicht-backfill komt hier sowieso niet),
-    // retry-cron van dezelfde foto, of het opnieuw insturen van een identieke foto.
-    $vorige_hash = _ozk_profielfoto_lees_fotohash($contact_id);
+    // 608 gaat ALLEEN naar de deelnemer/ouder bij een ECHTE nieuwe upload:
+    //   a) upload_bron moet een daadwerkelijke uploadroute zijn (entityform/webform/
+    //      crm-profiel) — NIET 'retry-cron'. De retry-cron herstart de verwerking van
+    //      een bestaand bestand (vaak een oude foto die ooit op fot_status=1 is blijven
+    //      hangen door een FPM-crash); dat is per definitie geen nieuwe upload, ook al
+    //      heeft deze contact nog geen hash-historie (casus Liam: bestand van 3 januari,
+    //      retry-cron pakte het op, hash was leeg → werd onterecht als 'nieuw' gezien).
+    //   b) de hash van de ruwe upload moet verschillen van de vorige verzonden foto —
+    //      voorkomt 608 bij re-processing of het opnieuw insturen van een identieke foto.
+    $is_echte_uploadroute = in_array($upload_bron, ['entityform', 'webform', 'crm-profiel'], TRUE);
+    $vorige_hash    = _ozk_profielfoto_lees_fotohash($contact_id);
     $is_nieuwe_foto = ($upload_hash !== '' && $upload_hash !== $vorige_hash);
-    wachthond($extdebug, 3, 'mail 608 nieuwe-foto-check',
-        'nieuw=' . ($upload_hash ?: '?') . ' vorig=' . ($vorige_hash ?: '-') . ' → ' . ($is_nieuwe_foto ? 'VERSTUREN' : 'overslaan'));
+    $mag_608        = $is_echte_uploadroute && $is_nieuwe_foto;
+    wachthond($extdebug, 3, 'mail 608 nieuwe-foto-check', 'bron=' . $upload_bron
+        . ' nieuw=' . ($upload_hash ?: '?') . ' vorig=' . ($vorige_hash ?: '-') . ' → ' . ($mag_608 ? 'VERSTUREN' : 'overslaan'));
 
-    if ($_to_email && $is_nieuwe_foto) {
+    if ($_to_email && $mag_608) {
         try {
             \CRM_Core_BAO_MessageTemplate::sendTemplate([
                 'messageTemplateID' => 608,
@@ -541,6 +548,8 @@ function _ozk_profielfoto_verwerk_na_move($dst_uri, $contact_id, $upload_bron) {
         }
     } elseif (!$_to_email) {
         wachthond($extdebug, 1, 'mail 608 overgeslagen: geen primair e-mailadres voor contact', $contact_id);
+    } elseif (!$is_echte_uploadroute) {
+        wachthond($extdebug, 3, 'mail 608 overgeslagen: geen echte uploadroute (bron=@b)', ['@b' => $upload_bron]);
     } else {
         wachthond($extdebug, 3, 'mail 608 overgeslagen: foto ongewijzigd t.o.v. vorige upload', $contact_id);
     }
