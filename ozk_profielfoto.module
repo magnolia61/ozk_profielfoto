@@ -436,6 +436,24 @@ function _ozk_profielfoto_verwerk_na_move($dst_uri, $contact_id, $upload_bron) {
     }
     $t_stap = $_tp('8. meta-ophalen (naam/allpart/event)', $t_stap);
 
+    // ── 8b. Eenmalige inloglink (OTL) richting het profielfoto-webform ────────
+    // Genereer een OTL die de gebruiker ECHT in Drupal inlogt en daarna op het
+    // webform landt (met cid1-prefill). Anders dan een kale checksum geeft dit een
+    // Drupal-sessie, zodat de gebruiker na de upload ook bv. /account kan bereiken.
+    // Faalt stil (leeg) als het contact geen Drupal-account heeft.
+    $otl_fotolink = '';
+    if (function_exists('ozk_onetimelogin')) {
+        $_uid = CRM_Core_BAO_UFMatch::getUFId($contact_id);
+        if ($_uid) {
+            $_acct = user_load($_uid);
+            if ($_acct) {
+                $_redir = 'form/profielfoto?cid1=' . (int) $contact_id;
+                $otl_fotolink = ozk_onetimelogin($_acct, '+7 day', $_redir) ?: '';
+            }
+        }
+        wachthond($extdebug, 3, 'otl_fotolink', $otl_fotolink ?: '(geen Drupal-account/leeg)');
+    }
+
     // ── 9+10. Mails (669 webteam + 608 indiener) ─────────────────────────────
     $tpl_params = [
         'fotoedit'      => 'https://www.onvergetelijk.nl/profielfoto',
@@ -443,6 +461,7 @@ function _ozk_profielfoto_verwerk_na_move($dst_uri, $contact_id, $upload_bron) {
         'user_kamplang' => $ditjaar_kampnaam ?: $ditjaar_kampkort ?: 'je kamp',
         'ozkweburl'     => 'https://www.onvergetelijk.nl',
         'user_cid'      => $contact_id,
+        'otl_fotolink'  => $otl_fotolink,
         'upload_bron'   => $upload_bron,
     ];
     try {
