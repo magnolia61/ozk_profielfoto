@@ -5,15 +5,23 @@
  * Vervangt de Rule: "Entityform Profielfoto Upload"
  */
 function ozk_profielfoto_entity_insert($entity, $type) {
-    if ($type === 'entityform' && $entity->type === 'profielfoto') {
-        if (!defined('OZK_PROFIELFOTO_AUTOCROP_ALTIJD')) {
-            define('OZK_PROFIELFOTO_AUTOCROP_ALTIJD', TRUE);
-        }
-        if (OZK_PROFIELFOTO_AUTOCROP_ALTIJD || _ozk_profielfoto_is_mobiel()) {
-            _ozk_profielfoto_autocrop_op_gezicht($entity);
-        }
-        _ozk_profielfoto_sync_profielfoto_naar_civicrm($entity);
+    if ($type !== 'entityform' || !in_array($entity->type, ['profielfoto', 'profielfoto_sq'])) {
+        return;
     }
+    $veld = field_get_items('entityform', $entity, 'field_profielfoto');
+    if (empty($veld[0]['fid'])) {
+        return;
+    }
+    $bestand = file_load($veld[0]['fid']);
+    if (!$bestand) {
+        return;
+    }
+    _ozk_profielfoto_plan_achtergrond([
+        'uid'         => $entity->uid,
+        'fid'         => (int) $bestand->fid,
+        'drupal_uri'  => $bestand->uri,
+        'upload_bron' => 'entityform',
+    ]);
 }
 
 /**
@@ -21,15 +29,23 @@ function ozk_profielfoto_entity_insert($entity, $type) {
  * Vervangt de Rule: "Entityform Profielfoto Update"
  */
 function ozk_profielfoto_entity_update($entity, $type) {
-    if ($type === 'entityform' && $entity->type === 'profielfoto') {
-        if (!defined('OZK_PROFIELFOTO_AUTOCROP_ALTIJD')) {
-            define('OZK_PROFIELFOTO_AUTOCROP_ALTIJD', TRUE);
-        }
-        if (OZK_PROFIELFOTO_AUTOCROP_ALTIJD || _ozk_profielfoto_is_mobiel()) {
-            _ozk_profielfoto_autocrop_op_gezicht($entity);
-        }
-        _ozk_profielfoto_sync_profielfoto_naar_civicrm($entity);
+    if ($type !== 'entityform' || !in_array($entity->type, ['profielfoto', 'profielfoto_sq'])) {
+        return;
     }
+    $veld = field_get_items('entityform', $entity, 'field_profielfoto');
+    if (empty($veld[0]['fid'])) {
+        return;
+    }
+    $bestand = file_load($veld[0]['fid']);
+    if (!$bestand) {
+        return;
+    }
+    _ozk_profielfoto_plan_achtergrond([
+        'uid'         => $entity->uid,
+        'fid'         => (int) $bestand->fid,
+        'drupal_uri'  => $bestand->uri,
+        'upload_bron' => 'entityform',
+    ]);
 }
 
 /**
@@ -37,174 +53,540 @@ function ozk_profielfoto_entity_update($entity, $type) {
  * Koppelt autocrop + derivative-generatie aan uploads via webform node 608 (Profielfoto).
  */
 function ozk_profielfoto_webform_submission_insert($node, $submission) {
-    _ozk_profielfoto_webform_foto_verwerken($node, $submission);
+    _ozk_profielfoto_webform_achtergrond_plannen($node, $submission);
 }
 
 /**
  * Implements hook_webform_submission_update().
  */
 function ozk_profielfoto_webform_submission_update($node, $submission) {
-    _ozk_profielfoto_webform_foto_verwerken($node, $submission);
+    _ozk_profielfoto_webform_achtergrond_plannen($node, $submission);
 }
 
 /**
- * Gedeelde logica voor webform-submission insert + update van node 608.
- * Voert face-detect autocrop uit en genereert alle derivatives inclusief square_profielfoto_crop.
+ * Haalt fid/uri op uit een webform-submission en plant achtergrondverwerking.
  */
-function _ozk_profielfoto_webform_foto_verwerken($node, $submission) {
+function _ozk_profielfoto_webform_achtergrond_plannen($node, $submission) {
     if ($node->nid != 608) {
         return;
     }
-
-    // Component cid=7 = profielfoto file-veld in webform 608.
     $fid = !empty($submission->data[7][0]) ? (int) $submission->data[7][0] : 0;
     if (!$fid) {
         watchdog('ozk_profielfoto', 'webform 608: geen fid in submission data[7]', [], WATCHDOG_WARNING);
         return;
     }
-
     $bestand = file_load($fid);
     if (!$bestand) {
         watchdog('ozk_profielfoto', 'webform 608: file_load(@fid) mislukt', ['@fid' => $fid], WATCHDOG_WARNING);
         return;
     }
+    _ozk_profielfoto_plan_achtergrond([
+        'uid'         => $submission->uid,
+        'fid'         => $fid,
+        'drupal_uri'  => $bestand->uri,
+        'upload_bron' => 'webform',
+    ]);
+}
 
-    $pad = drupal_realpath($bestand->uri);
-    if (!$pad || !is_file($pad)) {
-        watchdog('ozk_profielfoto', 'webform 608: bestand niet op schijf: @uri', ['@uri' => $bestand->uri], WATCHDOG_WARNING);
+/**
+ * Registreert de zware fotoverwerking als shutdown-functie zodat de browser
+ * de redirect ontvangt vóór facedetect/crop/derivatives/mails worden uitgevoerd.
+ *
+ * fastcgi_finish_request() sluit de HTTP-verbinding; PHP-FPM draait daarna door.
+ * Zonder die functie (mod_php) valt het terug op synchrone uitvoering in de shutdown.
+ *
+ * @param array $params  ['uid', 'fid', 'drupal_uri', 'upload_bron']
+ */
+function _ozk_profielfoto_plan_achtergrond(array $params) {
+    // Voorkom dubbele registratie als zowel insert als update vuren (Drupal-edge case).
+    static $_gepland = [];
+    $sleutel = $params['fid'] . ':' . $params['uid'];
+    if (!empty($_gepland[$sleutel])) {
         return;
     }
+    $_gepland[$sleutel] = TRUE;
 
-    // TIJDELIJKE VERGELIJKMODUS — zie entityform-pad. Draait op het origineel vóór de crop.
-    if (variable_get('ozk_profielfoto_vergelijk', FALSE)) {
-        module_load_include('inc', 'ozk_profielfoto', 'ozk_profielfoto.vergelijk');
-        if (function_exists('_ozk_profielfoto_vergelijk_varianten')) {
-            _ozk_profielfoto_vergelijk_varianten($pad, ['uid' => $submission->uid]);
-        }
-    }
+    watchdog('ozk_profielfoto', 'Achtergrondverwerking ingepland voor UID @uid, FID @fid via @bron.',
+        ['@uid' => $params['uid'], '@fid' => $params['fid'], '@bron' => $params['upload_bron']], WATCHDOG_INFO);
 
-    // Face-detect autocrop (zelfde kernlogica als entityform-upload).
-    _ozk_profielfoto_autocrop_op_pad($pad, $bestand);
+    drupal_register_shutdown_function('_ozk_profielfoto_verwerk_achtergrond', $params);
+}
 
-    // De webform-filecomponent slaat op in private:// → de URL wordt /system/files/...
-    // (toegangs-gecontroleerd: 403 voor anonieme bezoekers en e-mailclients → blanco
-    // foto in de mail). Verplaats daarom een publieke kopie naar de master-map, net als
-    // de entityform-route, en push DIE publieke URL naar CiviCRM.
-    $publiek = _ozk_profielfoto_kopieer_naar_public_master($bestand, $submission->uid);
-    if ($publiek) {
-        _ozk_profielfoto_push_image_url_naar_civicrm($submission->uid, $publiek['url'], $publiek['uri']);
+/**
+ * Voert de zware fotoverwerking uit ná het verzenden van de HTTP-response.
+ *
+ * Stappen (in volgorde, met TIMING-logging per stap):
+ *   0. Verbinding sluiten via fastcgi_finish_request() zodat browser klaar is
+ *   1. Bestand laden + realpath controleren
+ *   2. Contact.update image_URL
+ *   3. fot_status=1 ("in verwerking") schrijven — zichtbaar voor admin/retry-cron
+ *   4. Gedeelde verwerking: autocrop → derivatives → fot_status=2 → mails
+ *
+ * Noot: de webform-route schreef vroeger een public-master kopie (private→public).
+ * Dat is niet meer nodig: webform component 7 staat op scheme=public, bestanden
+ * landen direct in public://profielfotos/.
+ *
+ * @param array $params  ['uid', 'fid', 'drupal_uri', 'upload_bron']
+ */
+function _ozk_profielfoto_verwerk_achtergrond(array $params) {
+    $extdebug  = 'ozk_profielfoto';
+    $t_start   = microtime(TRUE);
+    $_tp = function($label, $t0) use ($extdebug, $t_start) {
+        $ms_stap   = round((microtime(TRUE) - $t0)    * 1000);
+        $ms_totaal = round((microtime(TRUE) - $t_start) * 1000);
+        watchdog($extdebug, "TIMING achtergrond [@ms_totaalms] $label: @ms_stap ms",
+            ['@ms_totaal' => $ms_totaal, '@ms_stap' => $ms_stap], WATCHDOG_DEBUG);
+        return microtime(TRUE);
+    };
+
+    $uid         = $params['uid'];
+    $fid         = $params['fid'];
+    $drupal_uri  = $params['drupal_uri'];
+    $upload_bron = $params['upload_bron'];
+
+    // ── 0. Verbinding sluiten ────────────────────────────────────────────────
+    // fastcgi_finish_request() stuurt de HTTP-response naar de browser en laat
+    // PHP-FPM daarna doordraaien. Zonder php-fpm (mod_php) is dit een no-op;
+    // de verwerking loopt dan gewoon synchroon in de shutdown (langzamer voor
+    // de gebruiker, maar correct). set_time_limit(0) voorkomt dat een lange
+    // facedetect-run afgebroken wordt door max_execution_time.
+    if (function_exists('fastcgi_finish_request')) {
+        fastcgi_finish_request();
     }
-    else {
-        // Terugval (zou niet moeten gebeuren): gebruik de ruwe URL.
-        watchdog('ozk_profielfoto', 'webform 608: public-master kopie mislukt voor uid @u, val terug op ruwe URL.', ['@u' => $submission->uid], WATCHDOG_WARNING);
-        _ozk_profielfoto_push_image_url_naar_civicrm($submission->uid, file_create_url($bestand->uri), $bestand->uri);
+    set_time_limit(0);
+
+    $t_stap = microtime(TRUE);
+    watchdog($extdebug, 'Achtergrondverwerking START voor UID @uid FID @fid via @bron.',
+        ['@uid' => $uid, '@fid' => $fid, '@bron' => $upload_bron], WATCHDOG_INFO);
+
+    // ── 1. Bestand laden ─────────────────────────────────────────────────────
+    $bestand = file_load($fid);
+    if (!$bestand) {
+        watchdog($extdebug, 'achtergrond: file_load(@fid) mislukt — stop.', ['@fid' => $fid], WATCHDOG_ERROR);
+        return;
     }
+    $pad = drupal_realpath($bestand->uri);
+    if (!$pad || !is_file($pad)) {
+        watchdog($extdebug, 'achtergrond: bestand niet op schijf: @uri — stop.', ['@uri' => $bestand->uri], WATCHDOG_ERROR);
+        return;
+    }
+    $t_stap = $_tp('1. file_load + realpath', $t_stap);
+
+    // ── 2. Contact.update image_URL ──────────────────────────────────────────
+    if (!civicrm_initialize()) {
+        watchdog($extdebug, 'achtergrond: civicrm_initialize mislukt — stop.', [], WATCHDOG_ERROR);
+        return;
+    }
+    $contact_id = CRM_Core_BAO_UFMatch::getContactId($uid);
+    if (!$contact_id) {
+        watchdog($extdebug, 'achtergrond: geen contact_id voor UID @u — stop.', ['@u' => $uid], WATCHDOG_ERROR);
+        return;
+    }
+    $image_url = file_create_url($drupal_uri);
+    $params_contact_update = [
+        'checkPermissions' => FALSE,
+        'debug'            => FALSE,
+        'where'            => [['id', '=', $contact_id]],
+        'values'           => ['image_URL' => $image_url],
+    ];
+    wachthond($extdebug, 7, 'params_contact_update', $params_contact_update);
+    $result_contact_update = civicrm_api4('Contact', 'update', $params_contact_update);
+    wachthond($extdebug, 9, 'result_contact_update', $result_contact_update);
+    $t_stap = $_tp('2. Contact.update image_URL', $t_stap);
+
+    // ── 3. fot_status=1 ("in verwerking") ────────────────────────────────────
+    // Schrijf direct na de contact-update zodat de retry-cron weet dat deze
+    // job gestart is. verwerk_na_move schrijft fot_status=2 als alles klaar is.
+    // ON DUPLICATE KEY zodat het veld ook aangemaakt wordt als er nog geen rij is.
+    db_query(
+        "INSERT INTO {civicrm_value_intake_181} (entity_id, fot_status_1798, fot_update_2253)
+         VALUES (:cid, 1, NOW())
+         ON DUPLICATE KEY UPDATE fot_status_1798 = 1, fot_update_2253 = NOW()",
+        [':cid' => $contact_id]
+    );
+    $t_stap = $_tp('3. fot_status=1 schrijven', $t_stap);
+
+    // ── 4. Gedeelde verwerking (autocrop → derivatives → fot_status=2 → mails) ─
+    _ozk_profielfoto_verwerk_na_move($drupal_uri, $contact_id, $upload_bron);
+
+    $ms_totaal = round((microtime(TRUE) - $t_start) * 1000);
+    watchdog($extdebug, 'Achtergrondverwerking KLAAR in @ms ms voor UID @uid via @bron.',
+        ['@ms' => $ms_totaal, '@uid' => $uid, '@bron' => $upload_bron], WATCHDOG_INFO);
 }
 
 /**
  * =======================================================================================
- * HELPER: _ozk_profielfoto_kopieer_naar_public_master
+ * KERN: _ozk_profielfoto_verwerk_na_move
  * =======================================================================================
- * Kopieert een (al gecropte) profielfoto naar de PUBLIEKE master-map
- * public://profielfotos/<slug>_<cid>_<Ymd>_<Hi>.<ext>, gelijk aan de entityform-route,
- * zodat image_URL en alle image-styles publiek bereikbaar zijn. Nodig voor de
- * webform-route, die in private:// opslaat (→ /system/files, 403 in mail/anoniem).
+ * Canonieke post-move verwerking: autocrop → upscale → derivatives → fot_status → mails.
+ * Gedeeld door alle drie uploadroutes (entityform, webform, crm-profiel).
  *
- * @param stdClass $bestand  Drupal file-object (uri wijst naar het bronbestand op schijf).
- * @param int      $uid      Drupal user-id van de indiener.
- * @return array|false       ['uri' => 'public://...', 'url' => 'https://...'] of FALSE.
+ * Wordt aangeroepen vanuit _ozk_profielfoto_verwerk_achtergrond() (entityform/webform)
+ * of rechtstreeks als shutdown function vanuit intake.php (crm-profiel route).
+ *
+ * @param string $dst_uri     Drupal URI van het bestand in zijn definitieve locatie
+ *                            (public://profielfotos/...). Wordt in-place gecropd.
+ * @param int    $contact_id  CiviCRM contact ID.
+ * @param string $upload_bron 'entityform' | 'webform' | 'crm-profiel'
  */
-function _ozk_profielfoto_kopieer_naar_public_master($bestand, $uid) {
+function _ozk_profielfoto_verwerk_na_move($dst_uri, $contact_id, $upload_bron) {
+    $extdebug = 'ozk_profielfoto';
+    $t_start  = microtime(TRUE);
+    $_tp = function($label, $t0) use ($extdebug, $t_start) {
+        $ms_stap   = round((microtime(TRUE) - $t0)    * 1000);
+        $ms_totaal = round((microtime(TRUE) - $t_start) * 1000);
+        watchdog($extdebug, "TIMING na_move    [@ms_totaalms] $label: @ms_stap ms",
+            ['@ms_totaal' => $ms_totaal, '@ms_stap' => $ms_stap], WATCHDOG_DEBUG);
+        return microtime(TRUE);
+    };
+
     if (!civicrm_initialize()) {
-        return FALSE;
+        watchdog($extdebug, 'verwerk_na_move: civicrm_initialize mislukt — stop.', [], WATCHDOG_ERROR);
+        return;
+    }
+    $pad = drupal_realpath($dst_uri);
+    if (!$pad || !is_file($pad)) {
+        watchdog($extdebug, 'verwerk_na_move: bestand niet op schijf: @uri — stop.', ['@uri' => $dst_uri], WATCHDOG_ERROR);
+        return;
+    }
+    watchdog($extdebug, 'verwerk_na_move START CID @cid via @bron: @f',
+        ['@cid' => $contact_id, '@bron' => $upload_bron, '@f' => basename($pad)], WATCHDOG_INFO);
+
+    $t_stap = microtime(TRUE);
+
+    // ── 1. Vergelijkmodus (tijdelijk, opt-in) — draait op origineel vóór crop ─
+    if (function_exists('variable_get') && variable_get('ozk_profielfoto_vergelijk', FALSE)) {
+        module_load_include('inc', 'ozk_profielfoto', 'ozk_profielfoto.vergelijk');
+        if (function_exists('_ozk_profielfoto_vergelijk_varianten')) {
+            _ozk_profielfoto_vergelijk_varianten($pad, ['contact_id' => (int) $contact_id]);
+        }
+        $t_stap = $_tp('1. vergelijk-modus', $t_stap);
     }
 
-    $contact_id = CRM_Core_BAO_UFMatch::getContactId($uid);
-    if (!$contact_id) {
-        return FALSE;
+    // ── 2. Facedetect + autocrop (in-place op $pad) ───────────────────────────
+    if (!defined('OZK_PROFIELFOTO_AUTOCROP_ALTIJD')) {
+        define('OZK_PROFIELFOTO_AUTOCROP_ALTIJD', TRUE);
     }
+    _ozk_profielfoto_autocrop_op_pad($pad);
+    $t_stap = $_tp('2. facedetect + autocrop', $t_stap);
 
-    // Slug uit display_name (alleen letters/cijfers, lowercase); val terug op 'foto'.
-    $naam = '';
+    // ── 3. Upscale naar ≥2160px tbv image_style_create_derivative ────────────
+    $_img = @getimagesize($pad);
+    if ($_img && max($_img[0], $_img[1]) < 2160) {
+        exec('magick ' . escapeshellarg($pad . '[0]') . ' -resize 2160x2160 -quality 92 ' . escapeshellarg($pad));
+        wachthond($extdebug, 3, 'bron opgeschaald naar 2160px', basename($pad));
+    }
+    $t_stap = $_tp('3. upscale naar 2160px', $t_stap);
+
+    // ── 4. Manualcrop-coördinaten meeschalen indien bron vergroot is ──────────
+    $_fid_mc = db_query("SELECT fid FROM {file_managed} WHERE uri = :uri", [':uri' => $dst_uri])->fetchField();
+    if ($_fid_mc && $_img) {
+        $_new_img = @getimagesize($pad);
+        if ($_new_img && $_new_img[0] !== $_img[0]) {
+            $_sx = $_new_img[0] / $_img[0];
+            $_sy = $_new_img[1] / $_img[1];
+            db_query(
+                "UPDATE {manualcrop} SET x=ROUND(x*:sx), y=ROUND(y*:sy), width=ROUND(width*:sx), height=ROUND(height*:sy) WHERE fid=:fid",
+                [':sx' => $_sx, ':sy' => $_sy, ':fid' => $_fid_mc]
+            );
+            wachthond($extdebug, 3, 'manualcrop coords meeopgeschaald', "sx={$_sx} sy={$_sy}");
+        }
+        // Vangrail: coords die buiten brondimensies vallen terugschalen.
+        $_src_now = @getimagesize($pad);
+        if ($_src_now) {
+            $_mc_row = db_query(
+                "SELECT x, y, width, height FROM {manualcrop} WHERE fid=:fid AND style_name='square_profielfoto'",
+                [':fid' => $_fid_mc]
+            )->fetchAssoc();
+            if ($_mc_row) {
+                $_mc_right  = $_mc_row['x'] + $_mc_row['width'];
+                $_mc_bottom = $_mc_row['y'] + $_mc_row['height'];
+                if ($_mc_right > $_src_now[0] || $_mc_bottom > $_src_now[1]) {
+                    $_scale = min($_src_now[0] / max($_mc_right, 1), $_src_now[1] / max($_mc_bottom, 1));
+                    db_update('manualcrop')
+                        ->fields([
+                            'x'      => (int) round($_mc_row['x']      * $_scale),
+                            'y'      => (int) round($_mc_row['y']      * $_scale),
+                            'width'  => (int) round($_mc_row['width']  * $_scale),
+                            'height' => (int) round($_mc_row['height'] * $_scale),
+                        ])
+                        ->condition('fid',        $_fid_mc)
+                        ->condition('style_name', 'square_profielfoto')
+                        ->execute();
+                    wachthond($extdebug, 3, 'manualcrop coords teruggeschaald', $_mc_row);
+                }
+            }
+        }
+    }
+    $t_stap = $_tp('4. manualcrop schalen', $t_stap);
+
+    // ── 5. Voornaam voor polaroid ─────────────────────────────────────────────
+    $_voornaam = ucwords(CRM_Core_DAO::singleValueQuery(
+        'SELECT first_name FROM civicrm_contact WHERE id = %1',
+        [1 => [(int) $contact_id, 'Integer']]
+    ) ?: '');
+
+    // ── 6. Derivatives (4 image-styles) ──────────────────────────────────────
+    $_font = DRUPAL_ROOT . '/sites/default/files/ozkcontent/Rambla-Bold.ttf';
+    foreach (['square_profielfoto', 'square_profielfoto_crop', 'square_0260', 'square_0260_naam'] as $_style_name) {
+        $_style_def = image_style_load($_style_name);
+        if (!$_style_def) continue;
+        $_style_uri = image_style_path($_style_name, $dst_uri);
+        $_style_dst = drupal_realpath($_style_uri);
+        @mkdir(dirname($_style_dst), 0775, TRUE);
+        if (!file_exists($_style_dst) || filesize($_style_dst) < 1000) {
+            image_style_create_derivative($_style_def, $dst_uri, $_style_uri);
+            wachthond($extdebug, 3, 'derivative aangemaakt', $_style_name);
+        }
+        if ($_style_name === 'square_0260_naam' && !empty($_voornaam) && file_exists($_style_dst)) {
+            exec('magick ' . escapeshellarg($_style_dst) .
+                ' -font ' . escapeshellarg($_font) .
+                ' -pointsize 21 -fill "#333333"' .
+                ' -gravity South -annotate +0+37 ' . escapeshellarg($_voornaam) .
+                ' ' . escapeshellarg($_style_dst));
+            wachthond($extdebug, 3, 'voornaam in polaroid geschreven', $_voornaam);
+        }
+    }
+    $t_stap = $_tp('5+6. voornaam + derivatives', $t_stap);
+
+    // ── 7. fot_update + fot_status ────────────────────────────────────────────
+    $new_fot_update = date('YmdHis');
+    CRM_Core_DAO::executeQuery(
+        'INSERT INTO civicrm_value_intake_181 (entity_id, fot_update_2253, fot_status_1798)
+         VALUES (%1, %2, 2)
+         ON DUPLICATE KEY UPDATE fot_update_2253 = %2, fot_status_1798 = 2',
+        [1 => [(int) $contact_id, 'Integer'], 2 => [$new_fot_update, 'String']]
+    );
+    wachthond($extdebug, 3, 'fot_update + fot_status bijgewerkt', $new_fot_update);
+    $t_stap = $_tp('7. fot_update + fot_status SQL', $t_stap);
+
+    // ── 8. Meta-ophalen (naam, kampkort, kampnaam) ────────────────────────────
+    $display_name     = '(onbekend)';
+    $ditjaar_kampkort = NULL;
+    $ditjaar_kampnaam = NULL;
     try {
-        $r    = civicrm_api4('Contact', 'get', [
+        $params_contact_naam = [
             'checkPermissions' => FALSE,
-            'select'           => ['display_name'],
+            'debug'            => FALSE,
+            'select'           => ['display_name', 'first_name'],
             'where'            => [['id', '=', $contact_id]],
+        ];
+        wachthond($extdebug, 7, 'params_contact_naam', $params_contact_naam);
+        $result_contact_naam = civicrm_api4('Contact', 'get', $params_contact_naam);
+        wachthond($extdebug, 9, 'result_contact_naam', $result_contact_naam);
+        $display_name     = $result_contact_naam->first()['display_name'] ?? '(onbekend)';
+        $_voornaam        = ucwords($result_contact_naam->first()['first_name'] ?? '');
+
+        $allpart_array    = function_exists('base_find_allpart') ? base_find_allpart($contact_id) : FALSE;
+        $ditjaar_kampkort = $allpart_array ? ($allpart_array['result_allpart_one_kampkort'] ?? NULL) : NULL;
+        $ditjaar_event_id = $allpart_array ? ($allpart_array['result_allpart_one_event_id'] ?? NULL) : NULL;
+        if (!empty($ditjaar_event_id)) {
+            $params_event = [
+                'checkPermissions' => FALSE,
+                'debug'            => FALSE,
+                'select'           => ['title'],
+                'where'            => [['id', '=', $ditjaar_event_id]],
+            ];
+            wachthond($extdebug, 7, 'params_event', $params_event);
+            $result_event     = civicrm_api4('Event', 'get', $params_event);
+            wachthond($extdebug, 9, 'result_event', $result_event);
+            $ditjaar_kampnaam = $result_event->first()['title'] ?? NULL;
+        }
+    } catch (\Throwable $_metaEx) {
+        wachthond($extdebug, 1, 'meta-ophalen mislukt, mail gaat door met fallback-waarden', $_metaEx->getMessage());
+    }
+    $t_stap = $_tp('8. meta-ophalen (naam/allpart/event)', $t_stap);
+
+    // ── 9+10. Mails (669 webteam + 608 indiener) ─────────────────────────────
+    $tpl_params = [
+        'fotoedit'      => 'https://www.onvergetelijk.nl/profielfoto',
+        'fotolink'      => image_style_url('square_0260', $dst_uri),
+        'user_kamplang' => $ditjaar_kampnaam ?: $ditjaar_kampkort ?: 'je kamp',
+        'ozkweburl'     => 'https://www.onvergetelijk.nl',
+        'user_cid'      => $contact_id,
+        'upload_bron'   => $upload_bron,
+    ];
+    try {
+        \CRM_Core_BAO_MessageTemplate::sendTemplate([
+            'messageTemplateID' => 669,
+            'contactId'         => $contact_id,
+            'toEmail'           => 'webteam@onvergetelijk.nl',
+            'toName'            => 'Webteam OZK',
+            'from'              => 'OZK <info@onvergetelijk.nl>',
+            'tplParams'         => $tpl_params,
         ]);
-        $naam = $r->first()['display_name'] ?? '';
+        wachthond($extdebug, 3, 'mail 669 webteam verzonden', $contact_id);
+    } catch (\Throwable $_sendEx) {
+        wachthond($extdebug, 1, 'sendTemplate 669 webteam mislukt', $_sendEx->getMessage());
     }
-    catch (Exception $e) {
-        // display_name niet ophaalbaar → slug wordt 'foto'.
+    $t_stap = $_tp('9. sendTemplate 669 (webteam)', $t_stap);
+
+    $_to_email = CRM_Core_DAO::singleValueQuery(
+        'SELECT email FROM civicrm_email WHERE contact_id = %1 AND is_primary = 1 LIMIT 1',
+        [1 => [(int) $contact_id, 'Integer']]
+    );
+    wachthond($extdebug, 3, 'mail 608 toEmail', $_to_email ?: '(geen)');
+    if ($_to_email) {
+        try {
+            \CRM_Core_BAO_MessageTemplate::sendTemplate([
+                'messageTemplateID' => 608,
+                'contactId'         => $contact_id,
+                'toEmail'           => $_to_email,
+                'from'              => 'OZK <info@onvergetelijk.nl>',
+                'tplParams'         => $tpl_params,
+            ]);
+            wachthond($extdebug, 3, 'mail 608 indiener verzonden', $_to_email);
+        } catch (\Throwable $_sendEx) {
+            wachthond($extdebug, 1, 'sendTemplate 608 indiener mislukt', $_sendEx->getMessage());
+        }
+    } else {
+        wachthond($extdebug, 1, 'mail 608 overgeslagen: geen primair e-mailadres voor contact', $contact_id);
     }
-    $slug = strtolower(preg_replace('/[^a-z0-9]/i', '', $naam));
-    if ($slug === '') {
-        $slug = 'foto';
+    $_tp('10. sendTemplate 608 (indiener)', $t_stap);
+
+    watchdog($extdebug, 'verwerk_na_move KLAAR in @ms ms voor CID @cid via @bron.',
+        ['@ms' => round((microtime(TRUE) - $t_start) * 1000), '@cid' => $contact_id, '@bron' => $upload_bron], WATCHDOG_INFO);
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Retry-cron voor mislukte fotoverwerkingen. Zoekt contacten met fot_status=1
+ * ("in verwerking") die ouder dan 30 minuten zijn — dat wijst op een FPM-crash
+ * halverwege de shutdown-functie. Per run maximaal 3 contacten om de cron
+ * niet te blokkeren.
+ *
+ * Voorwaarde: het bestand is al opgeslagen in civicrm_contact.image_URL;
+ * we leiden de lokale URI daaruit af en roepen verwerk_na_move opnieuw aan.
+ */
+function ozk_profielfoto_cron() {
+    if (!civicrm_initialize()) {
+        return;
     }
 
-    $bron = drupal_realpath($bestand->uri);
-    if (!$bron || !is_file($bron)) {
-        return FALSE;
-    }
-    $ext = strtolower(pathinfo($bestand->filename, PATHINFO_EXTENSION));
-    if ($ext === '') {
-        $ext = 'jpg';
-    }
+    $extdebug = 'ozk_profielfoto';
+    $drempel  = date('Y-m-d H:i:s', time() - 1800); // 30 minuten geleden
 
-    $dir = 'public://profielfotos';
-    if (!file_prepare_directory($dir, FILE_CREATE_DIRECTORY)) {
-        watchdog('ozk_profielfoto', 'public-master map niet schrijfbaar: @d', ['@d' => $dir], WATCHDOG_ERROR);
-        return FALSE;
-    }
+    // Haal contacten op met fot_status=1 ouder dan 30 min (max 3 per cron-run).
+    $rijen = CRM_Core_DAO::executeQuery(
+        "SELECT entity_id, fot_update_2253
+         FROM civicrm_value_intake_181
+         WHERE fot_status_1798 = 1
+           AND fot_update_2253 < %1
+         LIMIT 3",
+        [1 => [$drempel, 'String']]
+    );
 
-    $doel  = $dir . '/' . $slug . '_' . $contact_id . '_' . date('Ymd_Hi') . '.' . $ext;
-    $nieuw = file_unmanaged_copy($bron, $doel, FILE_EXISTS_REPLACE);
-    if (!$nieuw) {
-        return FALSE;
-    }
+    while ($rijen->fetch()) {
+        $contact_id = (int) $rijen->entity_id;
 
-    watchdog('ozk_profielfoto', 'webform-foto naar public master gekopieerd: @u', ['@u' => $nieuw], WATCHDOG_INFO);
-    return ['uri' => $nieuw, 'url' => file_create_url($nieuw)];
+        // Haal image_URL op om de lokale URI te achterhalen.
+        try {
+            $r = civicrm_api4('Contact', 'get', [
+                'checkPermissions' => FALSE,
+                'select'           => ['image_URL'],
+                'where'            => [['id', '=', $contact_id]],
+            ]);
+            $image_url = $r->first()['image_URL'] ?? '';
+        }
+        catch (Exception $e) {
+            watchdog($extdebug, 'retry-cron: Contact.get mislukt voor CID @c: @e',
+                ['@c' => $contact_id, '@e' => $e->getMessage()], WATCHDOG_ERROR);
+            continue;
+        }
+
+        if (!$image_url) {
+            watchdog($extdebug, 'retry-cron: geen image_URL voor CID @c — sla over.', ['@c' => $contact_id], WATCHDOG_WARNING);
+            // Zet fot_status=-1 zodat we dit niet blijven proberen.
+            CRM_Core_DAO::executeQuery(
+                "UPDATE civicrm_value_intake_181 SET fot_status_1798 = -1 WHERE entity_id = %1",
+                [1 => [$contact_id, 'Integer']]
+            );
+            continue;
+        }
+
+        // Vertaal de publieke URL terug naar een Drupal URI.
+        $base_public = file_create_url('public://');
+        if (strpos($image_url, $base_public) === 0) {
+            $drupal_uri = 'public://' . substr($image_url, strlen($base_public));
+        } else {
+            // URL is geen publieke Drupal-URL — we kunnen niets doen.
+            watchdog($extdebug, 'retry-cron: image_URL heeft onbekend schema voor CID @c: @u',
+                ['@c' => $contact_id, '@u' => $image_url], WATCHDOG_WARNING);
+            CRM_Core_DAO::executeQuery(
+                "UPDATE civicrm_value_intake_181 SET fot_status_1798 = -1 WHERE entity_id = %1",
+                [1 => [$contact_id, 'Integer']]
+            );
+            continue;
+        }
+
+        // Controleer of het bestand nog op schijf staat.
+        $pad = drupal_realpath($drupal_uri);
+        if (!$pad || !is_file($pad)) {
+            watchdog($extdebug, 'retry-cron: bestand niet op schijf voor CID @c: @u',
+                ['@c' => $contact_id, '@u' => $drupal_uri], WATCHDOG_WARNING);
+            CRM_Core_DAO::executeQuery(
+                "UPDATE civicrm_value_intake_181 SET fot_status_1798 = -1 WHERE entity_id = %1",
+                [1 => [$contact_id, 'Integer']]
+            );
+            continue;
+        }
+
+        watchdog($extdebug, 'retry-cron: herstart verwerking voor CID @c (@u)',
+            ['@c' => $contact_id, '@u' => $drupal_uri], WATCHDOG_INFO);
+
+        try {
+            _ozk_profielfoto_verwerk_na_move($drupal_uri, $contact_id, 'retry-cron');
+        }
+        catch (Exception $e) {
+            watchdog($extdebug, 'retry-cron: verwerk_na_move mislukt voor CID @c: @e',
+                ['@c' => $contact_id, '@e' => $e->getMessage()], WATCHDOG_ERROR);
+        }
+    }
 }
 
 /**
  * Implements hook_form_alter().
  */
 function ozk_profielfoto_form_alter(&$form, &$form_state, $form_id) {
-    if ($form_id === 'profielfoto_entityform_edit_form' || $form_id === 'entityform_edit_form') {
-        $bundle = isset($form['#bundle']) ? $form['#bundle'] : '';
-        if ($bundle === 'profielfoto' || $form_id === 'profielfoto_entityform_edit_form') {
-            
-            // DEBUG: Bevestig dat de alter is geladen
-            watchdog('ozk_profielfoto', "Form alter actief voor: @id", ['@id' => $form_id], WATCHDOG_DEBUG);
+    $bundle           = isset($form['#bundle']) ? $form['#bundle'] : '';
+    $is_profielfoto   = ($bundle === 'profielfoto'    || $form_id === 'profielfoto_entityform_edit_form');
+    $is_profielfoto_sq = ($bundle === 'profielfoto_sq' || $form_id === 'profielfoto_sq_entityform_edit_form');
 
-            $form['actions']['submit']['#submit'][] = '_ozk_profielfoto_profielfoto_redirect_force';
+    if (!($is_profielfoto || $is_profielfoto_sq)) {
+        return;
+    }
 
-            // Schakelaar: TRUE = autocrop altijd server-side (manualcrop verborgen).
-            //             FALSE = manualcrop zichtbaar voor desktop, autocrop alleen op mobiel.
-            define('OZK_PROFIELFOTO_AUTOCROP_ALTIJD', TRUE);
+    watchdog('ozk_profielfoto', "Form alter actief voor: @id (bundle: @b)", ['@id' => $form_id, '@b' => $bundle], WATCHDOG_DEBUG);
 
-            if (OZK_PROFIELFOTO_AUTOCROP_ALTIJD) {
-                // Verberg de manualcrop-thumblist volledig via CSS en onderdruk de validatie.
-                $form['#validate'][]    = '_ozk_profielfoto_crop_fout_vertalen';
-                drupal_add_css(
-                    '.manualcrop-thumblist, .ozk-crop-hint { display:none !important; }',
-                    ['type' => 'inline', 'group' => CSS_THEME, 'weight' => 99]
-                );
-            } else {
-                // Toon bijsnijden-UI met uitleg + vriendelijke foutmelding.
-                $form['#validate'][]    = '_ozk_profielfoto_crop_fout_vertalen';
-                $form['#after_build'][] = '_ozk_profielfoto_crop_uitleg_toevoegen';
-            }
+    $form['actions']['submit']['#submit'][] = '_ozk_profielfoto_profielfoto_redirect_force';
 
-            // HEIC/HEIF accepteren: hang onze converter vooraan de upload-validators
-            // van het fotoveld. Dit MOET hier (in form_alter, vóór form_builder),
-            // omdat managed_file de upload afhandelt in zijn #value_callback en niet
-            // in #process. Zie _ozk_profielfoto_validate_heic_naar_jpg().
-            if (isset($form['field_profielfoto'])) {
-                _ozk_profielfoto_heic_validator_inhaken($form['field_profielfoto']);
-            }
-        }
+    // profielfoto_sq: altijd server-side autocrop, nooit manualcrop-UI tonen.
+    // profielfoto:    schakelaar OZK_PROFIELFOTO_AUTOCROP_ALTIJD bepaalt gedrag.
+    $altijd_autocrop = $is_profielfoto_sq || TRUE; // profielfoto staat ook op TRUE
+    if (!defined('OZK_PROFIELFOTO_AUTOCROP_ALTIJD')) {
+        define('OZK_PROFIELFOTO_AUTOCROP_ALTIJD', $altijd_autocrop);
+    }
+
+    if ($altijd_autocrop) {
+        // Verberg de manualcrop-thumblist volledig via CSS en onderdruk de validatie.
+        $form['#validate'][]    = '_ozk_profielfoto_crop_fout_vertalen';
+        drupal_add_css(
+            '.manualcrop-thumblist, .ozk-crop-hint { display:none !important; }',
+            ['type' => 'inline', 'group' => CSS_THEME, 'weight' => 99]
+        );
+    } else {
+        // Toon bijsnijden-UI met uitleg + vriendelijke foutmelding.
+        $form['#validate'][]    = '_ozk_profielfoto_crop_fout_vertalen';
+        $form['#after_build'][] = '_ozk_profielfoto_crop_uitleg_toevoegen';
+    }
+
+    // HEIC/HEIF accepteren: hang onze converter vooraan de upload-validators
+    // van het fotoveld. Dit MOET hier (in form_alter, vóór form_builder),
+    // omdat managed_file de upload afhandelt in zijn #value_callback en niet
+    // in #process. Zie _ozk_profielfoto_validate_heic_naar_jpg().
+    if (isset($form['field_profielfoto'])) {
+        _ozk_profielfoto_heic_validator_inhaken($form['field_profielfoto']);
     }
 }
 
@@ -310,47 +692,6 @@ function _ozk_profielfoto_is_mobiel() {
 }
 
 /**
- * =======================================================================================
- * HELPER: _ozk_profielfoto_autocrop_op_gezicht
- * =======================================================================================
- * Roept ozk-facedetect aan op de geüploade foto. Als er een gezicht gevonden wordt,
- * snijdt ImageMagick de foto vierkant bij rondom het gezicht (met padding voor hoofd +
- * schouders). Zo hoeft een mobiele gebruiker niet zelf te croppen via de cropper.
- *
- * Het bestand wordt IN PLACE overschreven: het fid blijft hetzelfde, alleen de
- * bestandsinhoud en afmetingen veranderen.
- */
-function _ozk_profielfoto_autocrop_op_gezicht($entity) {
-    $veld = field_get_items('entityform', $entity, 'field_profielfoto');
-    if (empty($veld[0]['fid'])) {
-        return;
-    }
-
-    $bestand = file_load($veld[0]['fid']);
-    if (!$bestand) {
-        return;
-    }
-
-    $pad = drupal_realpath($bestand->uri);
-    if (!$pad || !is_file($pad)) {
-        watchdog('ozk_profielfoto', 'autocrop: bestand niet gevonden op schijf: @uri', ['@uri' => $bestand->uri], WATCHDOG_WARNING);
-        return;
-    }
-
-    // TIJDELIJKE VERGELIJKMODUS (drush vset ozk_profielfoto_vergelijk 1): maak en mail
-    // een montage van álle detector- + crop-varianten op het ORIGINEEL, vóór de
-    // productie-crop hieronder het bestand overschrijft. Productie blijft ongewijzigd.
-    if (variable_get('ozk_profielfoto_vergelijk', FALSE)) {
-        module_load_include('inc', 'ozk_profielfoto', 'ozk_profielfoto.vergelijk');
-        if (function_exists('_ozk_profielfoto_vergelijk_varianten')) {
-            _ozk_profielfoto_vergelijk_varianten($pad, ['uid' => $entity->uid]);
-        }
-    }
-
-    _ozk_profielfoto_autocrop_op_pad($pad, $bestand);
-}
-
-/**
  * Kernlogica van de autocrop: werkt op een absoluut bestandspad.
  * Wordt aangeroepen vanuit zowel entityform- als webform-uploads.
  *
@@ -360,6 +701,13 @@ function _ozk_profielfoto_autocrop_op_gezicht($entity) {
 function _ozk_profielfoto_autocrop_op_pad($pad, $bestand = NULL) {
     $extdebug = 'ozk_profielfoto';
     $t_start  = microtime(TRUE);
+    $_t       = function($label, $t0) use ($extdebug, $t_start) {
+        $ms_stap  = round((microtime(TRUE) - $t0)    * 1000);
+        $ms_totaal = round((microtime(TRUE) - $t_start) * 1000);
+        watchdog($extdebug, "TIMING autocrop  [@ms_totaalms] $label: @ms_stap ms",
+            ['@ms_totaal' => $ms_totaal, '@ms_stap' => $ms_stap], WATCHDOG_DEBUG);
+        return microtime(TRUE);
+    };
 
     // ------------------------------------------------------------------ 0. Orientatie normaliseren
     // Bak een eventuele EXIF-rotatie IN het bestand voordat we iets meten of snijden.
@@ -370,6 +718,7 @@ function _ozk_profielfoto_autocrop_op_pad($pad, $bestand = NULL) {
     // achtergrond, zoals bij Loa). Na normaliseren zitten detectie, geometrie en crop
     // allemaal in dezelfde, opgerichte ruimte. Alleen herschrijven als er echt rotatie is,
     // zodat we niet onnodig hercomprimeren.
+    $t_stap = microtime(TRUE);
     $orient = trim((string) shell_exec('magick identify -format %[orientation] ' . escapeshellarg($pad . '[0]') . ' 2>/dev/null'));
     if ($orient !== '' && $orient !== 'TopLeft' && $orient !== 'Undefined') {
         exec('magick ' . escapeshellarg($pad . '[0]') . ' -auto-orient +repage -quality 95 ' . escapeshellarg($pad), $uo, $rvo);
@@ -378,6 +727,7 @@ function _ozk_profielfoto_autocrop_op_pad($pad, $bestand = NULL) {
             $bestand->filesize = filesize($pad);
         }
     }
+    $t_stap = $_t('0. EXIF-orientatie', $t_stap);
 
     // ------------------------------------------------------------------ 1. Gezicht detecteren
     // Detectie op origineel of max 4320px (2×2160) zodat kleine gezichten goed gevonden
@@ -390,7 +740,6 @@ function _ozk_profielfoto_autocrop_op_pad($pad, $bestand = NULL) {
     $tmp_detect   = $pad . '.detect.jpg';
     $img_info_pre = getimagesize($pad);
     $schaal       = 1.0;
-    $t_pre        = microtime(TRUE);
     if ($img_info_pre && max($img_info_pre[0], $img_info_pre[1]) > 4320) {
         exec('magick ' . escapeshellarg($pad . '[0]') . " -resize '4320x4320>' " . escapeshellarg($tmp_detect));
         $tmp_info = getimagesize($tmp_detect);
@@ -401,18 +750,14 @@ function _ozk_profielfoto_autocrop_op_pad($pad, $bestand = NULL) {
     } else {
         $detect_pad = $pad;
     }
-    $t_preshrink = microtime(TRUE);
-    watchdog($extdebug, 'TIMING pre-shrink: @ms ms (orig @bx@h → detectie op @dp)',
-        ['@ms' => round(($t_preshrink - $t_pre) * 1000), '@b' => $img_info_pre[0] ?? '?',
-         '@h' => $img_info_pre[1] ?? '?', '@dp' => basename($detect_pad)], WATCHDOG_DEBUG);
+    $t_stap = $_t('1. pre-shrink (orig ' . ($img_info_pre[0] ?? '?') . 'x' . ($img_info_pre[1] ?? '?') . ' → ' . basename($detect_pad) . ')', $t_stap);
 
     // De detector draait meerdere engines parallel (HOG + YuNet + evt. MediaPipe) en
     // geeft het beste, door consensus bevestigde gezicht terug; te kleine kandidaten
     // (false positives) worden binnen het script al weggefilterd op $min_face_ratio.
     $cmd_detect = escapeshellarg($script) . ' ' . escapeshellarg($detect_pad) . ' ' . escapeshellarg((string) $min_face_ratio);
     $json_raw   = shell_exec($cmd_detect);
-    $t_detect   = microtime(TRUE);
-    watchdog($extdebug, 'TIMING facedetect: @ms ms', ['@ms' => round(($t_detect - $t_preshrink) * 1000)], WATCHDOG_DEBUG);
+    $t_stap = $_t('2. facedetect (HOG+YuNet)', $t_stap);
 
     if (isset($tmp_detect) && file_exists($tmp_detect)) {
         @unlink($tmp_detect);
@@ -487,9 +832,16 @@ function _ozk_profielfoto_autocrop_op_pad($pad, $bestand = NULL) {
         return;
     }
 
-    // Padding: 2.5× de gezichtshoogte → ruimte voor kruin + schouders
-    $zijde = (int) round(max($gz_breed, $gz_hoogte) * 2.5);
-    $zijde = max($zijde, 100); // minimaal 100px
+    // Adaptieve crop: stuur op gezicht = 35% van de crop-hoogte zodat de
+    // gezichtsverhouding constant blijft ongeacht of de bronopname al strak of
+    // juist wijd is (vaste factor zoals 2.5× zoomt bij close-ups te ver in).
+    $doel_fractie = 0.35;
+    $gz_max       = max($gz_breed, $gz_hoogte);
+    $zijde        = (int) round($gz_max / $doel_fractie);
+    // Vangrails: nooit kleiner dan 1.5× gezicht (extreme close-up), minimaal 100px,
+    // en nooit groter dan de kortste zijde van de foto.
+    $zijde = max($zijde, (int) round($gz_max * 1.5), 100);
+    $zijde = min($zijde, $img_breed, $img_hoogte);
 
     // Gezichtscentrum op 42% van boven zodat kruin én kin goed passen
     $crop_top  = $gz_cy - (int) round($zijde * 0.42);
@@ -512,8 +864,7 @@ function _ozk_profielfoto_autocrop_op_pad($pad, $bestand = NULL) {
         escapeshellarg($pad)
     );
     exec($cmd_crop, $uitvoer, $rv);
-    $t_crop = microtime(TRUE);
-    watchdog($extdebug, 'TIMING ImageMagick crop+resize: @ms ms', ['@ms' => round(($t_crop - $t_detect) * 1000)], WATCHDOG_DEBUG);
+    $t_stap = $_t('3. ImageMagick crop', $t_stap);
 
     if ($rv !== 0) {
         watchdog($extdebug, 'autocrop: ImageMagick crop mislukt (rv=@rv) voor @f', ['@rv' => $rv, '@f' => $_bestandsnaam], WATCHDOG_ERROR);
@@ -526,7 +877,8 @@ function _ozk_profielfoto_autocrop_op_pad($pad, $bestand = NULL) {
         file_save($bestand);
     }
 
-    watchdog($extdebug, 'autocrop: crop geslaagd (@g) voor @f — totaal @ms ms',
+    $t_stap = $_t('4. file_save na crop', $t_stap);
+    watchdog($extdebug, 'autocrop: crop geslaagd (@g) voor @f — TOTAAL @ms ms',
         ['@g' => $geometry, '@f' => $_bestandsnaam, '@ms' => round((microtime(TRUE) - $t_start) * 1000)], WATCHDOG_INFO);
 }
 
@@ -668,286 +1020,38 @@ function _ozk_profielfoto_profielfoto_redirect_force($form, &$form_state) {
 
 /**
  * =======================================================================================
- * HELPER: _ozk_profielfoto_sync_profielfoto_naar_civicrm
- * =======================================================================================
- * Haalt de geüploade foto uit de Entityform en pusht de gecropte URL naar CiviCRM.
- * De square_profielfoto image style past de manualcrop-selectie van de gebruiker toe.
- * Dit triggert automatisch de intake_civicrm_pre hook in intake.php, die de
- * datums (custom_2253 en custom_1798) perfect en zonder timing-conflicten beheert.
- */
-function _ozk_profielfoto_sync_profielfoto_naar_civicrm($entity) {
-	$extdebug				= 'intake.profielfoto';
-	$t_sync_start			= microtime(TRUE);
-
-	// 1. Controleer of er een bestand is geüpload
-	$field_data				= field_get_items('entityform', $entity, 'field_profielfoto');
-
-	if (!$field_data || empty($field_data[0]['uri'])) {
-		return;
-	}
-
-	// 2. Gebruik de square_profielfoto styled URL voor CiviCRM zodat de manualcrop
-	//    selectie van de gebruiker ook in het CiviCRM-profielfoto-veld terecht komt.
-	//    Op mobiel is de file al vierkant bijgesneden door autocrop; gebruik dan de
-	//    directe file-URL zodat er geen mislukte manualcrop-derivative wordt aangevraagd.
-	$drupal_uri             = $field_data[0]['uri'];
-	if (!defined('OZK_PROFIELFOTO_AUTOCROP_ALTIJD')) {
-		define('OZK_PROFIELFOTO_AUTOCROP_ALTIJD', TRUE);
-	}
-	if (OZK_PROFIELFOTO_AUTOCROP_ALTIJD || _ozk_profielfoto_is_mobiel()) {
-		// Bestand is al vierkant bijgesneden door autocrop.
-		// Sla de directe bestandsURL op — de CiviCRM Views handler past zelf de
-		// gewenste image style toe per view display (square_0260, square_0320, etc.).
-		$image_url = file_create_url($drupal_uri);
-	} else {
-		$image_url = image_style_url('square_profielfoto', $drupal_uri);
-	}
-	_ozk_profielfoto_push_image_url_naar_civicrm($entity->uid, $image_url, $drupal_uri);
-}
-
-/**
- * =======================================================================================
  * HELPER (testbare seam): _ozk_profielfoto_push_image_url_naar_civicrm
  * =======================================================================================
- * Pusht een absolute image-URL naar CiviCRM voor een gegeven Drupal-UID en stuurt de
- * notificatiemail. Afgesplitst van _ozk_profielfoto_sync_profielfoto_naar_civicrm() zodat
- * e2e-tests de volledige sync -> intake-pre-hook -> DB-keten kunnen draaien zonder de
- * Drupal-only field_get_items()/file_create_url() te stubben (die in de e2e-boot niet te
- * overschrijven zijn omdat Drupal's eigen versie al geladen is).
+ * Dunne wrapper voor e2e-tests: zoekt contact_id via UFMatch, doet Contact.update
+ * image_URL en delegeert alle verwerking naar _ozk_profielfoto_verwerk_na_move().
  *
- * @param string      $image_url   Gecropte absolute URL (square_profielfoto style) → naar CiviCRM
- * @param string|null $drupal_uri  Originele Drupal URI (public://...) voor mail-thumbnail generatie
+ * @param int         $uid         Drupal user ID
+ * @param string      $image_url   Absolute URL (ongebruikt — image_url wordt afgeleid uit $drupal_uri)
+ * @param string|null $drupal_uri  Drupal URI (public://...) van het bestand
+ * @param string      $upload_bron 'entityform' | 'webform' | 'crm-profiel'
  */
-function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url, $drupal_uri = NULL) {
-	$extdebug				= 'intake.profielfoto';
-	// Starttijd voor de TIMING-log verderop (push → e-mail). Lokaal gezet zodat de
-	// variabele in scope is: $t_sync_start uit _ozk_profielfoto_sync_...() leeft niet
-	// in deze functie, en push is een testbare seam die ook rechtstreeks wordt aangeroepen.
-	$t_sync_start			= microtime(TRUE);
-
-	if (!civicrm_initialize()) {
-		return;
-	}
-
-	$contact_id				= CRM_Core_BAO_UFMatch::getContactId($uid);
-
-	if ($contact_id) {
-		
-		wachthond($extdebug, 2, "########################################################################");
-		wachthond($extdebug, 1, "### DRUPAL SYNC: PROFIELFOTO NAAR CIVICRM PUSHEN",		"[CID: $contact_id]");
-		wachthond($extdebug, 2, "########################################################################");
-
-		wachthond($extdebug, 3, 'image_url direct SQL', $image_url);
-
-		try {
-			// 3. Directe SQL voor image_URL — bypast delta/stgave/training hook-stack (~12-19s).
-			//    image_URL is geen bedrijfslogica-veld; hooks hoeven hier niet te vuren.
-			CRM_Core_DAO::executeQuery(
-				'UPDATE civicrm_contact SET image_URL = %1 WHERE id = %2',
-				[1 => [$image_url, 'String'], 2 => [$contact_id, 'Integer']]
-			);
-			wachthond($extdebug, 3, 'image_url bijgewerkt via SQL', $contact_id);
-
-			// 3b. Foto datum + status direct via SQL (base_api_wrapper → Contact.update triggert
-			//     anders de volledige hook-stack van ~20s; civicrm_value_intake_181 UPSERT).
-			// OZK_PROFIELFOTO_AUTOCROP_ALTIJD = TRUE: autocrop garandeert altijd een vierkant
-			// resultaat → direct status 2 ('vierkant') wegschrijven, geen recompute nodig.
-			$new_fot_update = date('YmdHis');
-			CRM_Core_DAO::executeQuery(
-				'INSERT INTO civicrm_value_intake_181 (entity_id, fot_update_2253, fot_status_1798)
-				 VALUES (%1, %2, 2)
-				 ON DUPLICATE KEY UPDATE fot_update_2253 = %2, fot_status_1798 = 2',
-				[1 => [$contact_id, 'Integer'], 2 => [$new_fot_update, 'String']]
-			);
-			wachthond($extdebug, 3, 'fot_update + fot_status direct SQL', $new_fot_update);
-			
-			watchdog('ozk_profielfoto', "Profielfoto URL succesvol gesynchroniseerd voor CID: $contact_id", NULL, WATCHDOG_INFO);
-
-			// 5. E-mail notificatie versturen (met Ymd_His timestamp)
-			// ... binnen de _ozk_profielfoto_sync_profielfoto_naar_civicrm functie ...
-
-			// Displayname + voornaam ophalen via APIv4
-			$params_contact_naam = [
-				'checkPermissions' => FALSE,
-				'debug'            => FALSE,
-				'select'           => ['display_name', 'first_name'],
-				'where'            => [['id', '=', $contact_id]],
-			];
-			wachthond($extdebug, 7, 'params_contact_naam',  $params_contact_naam);
-			$result_contact_naam = civicrm_api4('Contact', 'get', $params_contact_naam);
-			wachthond($extdebug, 9, 'result_contact_naam',  $result_contact_naam);
-			$display_name        = $result_contact_naam->first()['display_name'] ?? '(onbekend)';
-			$_voornaam           = ucwords($result_contact_naam->first()['first_name'] ?? '');
-
-			// Ditjaar kampkort en kampfunctie via base_find_allpart
-			$allpart_array       = function_exists('base_find_allpart') ? base_find_allpart($contact_id) : FALSE;
-			$ditjaar_kampkort    = $allpart_array ? ($allpart_array['result_allpart_one_kampkort']    ?? NULL) : NULL;
-			$ditjaar_kampfunctie = $allpart_array ? ($allpart_array['result_allpart_one_kampfunctie'] ?? NULL) : NULL;
-			$ditjaar_event_id    = $allpart_array ? ($allpart_array['result_allpart_one_event_id']    ?? NULL) : NULL;
-			wachthond($extdebug, 3, 'ditjaar_kampkort',     $ditjaar_kampkort);
-			wachthond($extdebug, 3, 'ditjaar_kampfunctie',  $ditjaar_kampfunctie);
-
-			// Haal event-titel op als kamplang (lange naam voor indiener-mail).
-			$ditjaar_kampnaam = NULL;
-			if ($ditjaar_event_id) {
-				$params_event = [
-					'checkPermissions' => FALSE,
-					'select'           => ['title'],
-					'where'            => [['id', '=', $ditjaar_event_id]],
-				];
-				wachthond($extdebug, 7, 'params_event', $params_event);
-				$result_event     = civicrm_api4('Event', 'get', $params_event);
-				wachthond($extdebug, 9, 'result_event', $result_event);
-				$ditjaar_kampnaam = $result_event->first()['title'] ?? NULL;
-			}
-			wachthond($extdebug, 3, 'ditjaar_kampnaam', $ditjaar_kampnaam);
-
-			// Pre-genereer alle benodigde image-style derivatives zodat de tokens
-			// in mails direct werken zonder on-demand generatie door Drupal.
-			// Schaal bron eerst op naar ≥2160px zodat image_style_create_derivative
-			// niet faalt op manualcrop respectminimum (stijl verwacht bron ≥ stijlafmeting).
-			if ($drupal_uri) {
-				$_lokpad = drupal_realpath($drupal_uri);
-				$_img    = @getimagesize($_lokpad);
-				$_fid_mc = db_query("SELECT fid FROM {file_managed} WHERE uri = :uri", [':uri' => $drupal_uri])->fetchField();
-				if ($_img && $_img[0] < 2160) {
-					$_orig_w = $_img[0];
-					$_orig_h = $_img[1];
-					exec('magick ' . escapeshellarg($_lokpad . '[0]') .
-						' -resize 2160x2160' .
-						' -quality 92 ' . escapeshellarg($_lokpad));
-					wachthond($extdebug, 3, 'bron opgeschaald naar 2160px tbv image_style', basename($_lokpad));
-					// Schaal ook de manualcrop-coördinaten proportioneel mee, anders
-					// verwijzen ze nog naar de kleinere originele dimensies en levert
-					// image_style_create_derivative een verkeerde/lege crop op.
-					$_new_img = @getimagesize($_lokpad);
-					if ($_fid_mc && $_new_img && $_new_img[0] !== $_orig_w) {
-						$_sx = $_new_img[0] / $_orig_w;
-						$_sy = $_new_img[1] / $_orig_h;
-						db_query(
-							"UPDATE {manualcrop} SET x=ROUND(x*:sx), y=ROUND(y*:sy), width=ROUND(width*:sx), height=ROUND(height*:sy) WHERE fid=:fid",
-							[':sx' => $_sx, ':sy' => $_sy, ':fid' => $_fid_mc]
-						);
-						wachthond($extdebug, 1, 'manualcrop coords meeopgeschaald', "sx={$_sx} sy={$_sy}");
-					}
-				}
-				// Vang ook het geval waar de bron al verkleind was ten opzichte van de
-				// originele upload (bijv. iOS-foto op lagere resolutie gedeeld): als de
-				// manualcrop-coördinaten de huidige brondimensies overschrijden, schaal
-				// ze dan proportioneel terug zodat de crop wél past.
-				$_src_now = @getimagesize($_lokpad);
-				if ($_fid_mc && $_src_now) {
-					$_mc_row = db_query(
-						"SELECT x, y, width, height FROM {manualcrop} WHERE fid=:fid AND style_name='square_profielfoto'",
-						[':fid' => $_fid_mc]
-					)->fetchAssoc();
-					if ($_mc_row) {
-						$_mc_right  = $_mc_row['x'] + $_mc_row['width'];
-						$_mc_bottom = $_mc_row['y'] + $_mc_row['height'];
-						if ($_mc_right > $_src_now[0] || $_mc_bottom > $_src_now[1]) {
-							$_scale = min(
-								$_src_now[0] / max($_mc_right, 1),
-								$_src_now[1] / max($_mc_bottom, 1)
-							);
-							db_update('manualcrop')
-								->fields([
-									'x'      => (int)round($_mc_row['x']      * $_scale),
-									'y'      => (int)round($_mc_row['y']      * $_scale),
-									'width'  => (int)round($_mc_row['width']  * $_scale),
-									'height' => (int)round($_mc_row['height'] * $_scale),
-								])
-								->condition('fid',        $_fid_mc)
-								->condition('style_name', 'square_profielfoto')
-								->execute();
-							wachthond($extdebug, 1, 'manualcrop coords teruggeschaald (bron kleiner dan coords)', $_mc_row);
-						}
-					}
-				}
-				foreach (['square_profielfoto', 'square_profielfoto_crop', 'square_0260', 'square_0260_naam'] as $_style_name) {
-					$_style_def = image_style_load($_style_name);
-					if (!$_style_def) continue;
-					$_style_uri = image_style_path($_style_name, $drupal_uri);
-					$_style_dst = drupal_realpath($_style_uri);
-					@mkdir(dirname($_style_dst), 0775, TRUE);
-					if (!file_exists($_style_dst) || filesize($_style_dst) < 1000) {
-						image_style_create_derivative($_style_def, $drupal_uri, $_style_uri);
-						wachthond($extdebug, 3, 'derivative aangemaakt via image_style', $_style_name);
-					}
-					// Voornaam in witte balk van de polaroid — alleen voor de _naam variant.
-					// image_effects_text vereist de php-module (uitgeschakeld); wij doen het post-hoc.
-					if ($_style_name === 'square_0260_naam' && !empty($_voornaam) && file_exists($_style_dst)) {
-						$_font = DRUPAL_ROOT . '/sites/default/files/ozkcontent/Rambla-Bold.ttf';
-						exec('magick ' . escapeshellarg($_style_dst) .
-							' -font ' . escapeshellarg($_font) .
-							' -pointsize 21 -fill "#333333"' .
-							' -gravity South -annotate +0+37 ' . escapeshellarg($_voornaam) .
-							' ' . escapeshellarg($_style_dst));
-						wachthond($extdebug, 3, 'voornaam in polaroid geschreven', $_voornaam);
-					}
-				}
-			}
-
-			// Bereken square_0260 URL voor de polaroid in de mail.
-			$sq0260_url = $drupal_uri ? image_style_url('square_0260', $drupal_uri) : $image_url;
-
-			$tpl_params = [
-				'fotoedit'      => 'https://www.onvergetelijk.nl/profielfoto',
-				'fotolink'      => $sq0260_url,
-				'user_kamplang' => $ditjaar_kampnaam ?: $ditjaar_kampkort ?: 'je kamp',
-				'ozkweburl'     => 'https://www.onvergetelijk.nl',
-				'user_cid'      => $contact_id,
-			];
-
-			wachthond($extdebug, 3, 'TIMING push tot e-mail: ' . round((microtime(TRUE) - $t_sync_start) * 1000) . ' ms', '');
-
-			// Webteam-notificatie (669).
-			try {
-				\CRM_Core_BAO_MessageTemplate::sendTemplate([
-					'messageTemplateID' => 669,
-					'contactId'         => $contact_id,
-					'toEmail'           => 'webteam@onvergetelijk.nl',
-					'toName'            => 'Webteam OZK',
-					'from'              => 'OZK <info@onvergetelijk.nl>',
-					'tplParams'         => $tpl_params,
-				]);
-				wachthond($extdebug, 3, "mail 669 webteam verzonden", $contact_id);
-			} catch (\Throwable $sendEx) {
-				wachthond($extdebug, 1, "sendTemplate 669 webteam mislukt", $sendEx->getMessage());
-			}
-
-			// Indiener-bevestiging (608) naar primair e-mailadres van het contact.
-			// toEmail expliciet opzoeken: sendTemplate zonder toEmail faalt stil als
-			// het contact geen rij in civicrm_email heeft of de lookup niets oplevert.
-			$_to_email = CRM_Core_DAO::singleValueQuery(
-				'SELECT email FROM civicrm_email WHERE contact_id = %1 AND is_primary = 1 LIMIT 1',
-				[1 => [$contact_id, 'Integer']]
-			);
-			wachthond($extdebug, 3, 'mail 608 toEmail', $_to_email ?: '(geen)');
-			if ($_to_email) {
-				try {
-					\CRM_Core_BAO_MessageTemplate::sendTemplate([
-						'messageTemplateID' => 608,
-						'contactId'         => $contact_id,
-						'toEmail'           => $_to_email,
-						'from'              => 'OZK <info@onvergetelijk.nl>',
-						'tplParams'         => $tpl_params,
-					]);
-					wachthond($extdebug, 3, "mail 608 indiener verzonden", $_to_email);
-				} catch (\Throwable $sendEx) {
-					wachthond($extdebug, 1, "sendTemplate 608 indiener mislukt", $sendEx->getMessage());
-				}
-			} else {
-				wachthond($extdebug, 1, "mail 608 overgeslagen: geen primair e-mailadres voor contact", $contact_id);
-			}
-
-		} catch (\Exception $e) {
-			$error_msg			= $e->getMessage();
-			wachthond($extdebug, 1, "FATAAL: Fout bij pushen profielfoto naar CiviCRM",	$error_msg);
-			watchdog('ozk_profielfoto', "Fout bij pushen profielfoto: $error_msg", NULL, WATCHDOG_ERROR);
-		}
-	} else {
-		watchdog('ozk_profielfoto', "Geen CiviCRM contact gevonden voor Drupal UID: $uid", NULL, WATCHDOG_WARNING);
-	}
+function _ozk_profielfoto_push_image_url_naar_civicrm($uid, $image_url, $drupal_uri = NULL, $upload_bron = 'onbekend') {
+    if (!civicrm_initialize()) {
+        return;
+    }
+    $contact_id = CRM_Core_BAO_UFMatch::getContactId($uid);
+    if (!$contact_id) {
+        watchdog('ozk_profielfoto', 'push_image_url: geen contact_id voor UID @u', ['@u' => $uid], WATCHDOG_WARNING);
+        return;
+    }
+    $dst_uri = $drupal_uri ?: NULL;
+    if ($dst_uri) {
+        $params_contact_update = [
+            'checkPermissions' => FALSE,
+            'debug'            => FALSE,
+            'where'            => [['id', '=', $contact_id]],
+            'values'           => ['image_URL' => file_create_url($dst_uri)],
+        ];
+        civicrm_api4('Contact', 'update', $params_contact_update);
+    }
+    if ($dst_uri) {
+        _ozk_profielfoto_verwerk_na_move($dst_uri, $contact_id, $upload_bron);
+    }
 }
 
 
