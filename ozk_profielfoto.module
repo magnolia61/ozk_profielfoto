@@ -335,7 +335,7 @@ function _ozk_profielfoto_verwerk_na_move($dst_uri, $contact_id, $upload_bron) {
     if (!defined('OZK_PROFIELFOTO_AUTOCROP_ALTIJD')) {
         define('OZK_PROFIELFOTO_AUTOCROP_ALTIJD', TRUE);
     }
-    _ozk_profielfoto_autocrop_op_pad($pad);
+    _ozk_profielfoto_autocrop_op_pad($pad, NULL, $contact_id);
     $t_stap = $_tp('2. facedetect + autocrop', $t_stap);
 
     // ── 3. Upscale naar ≥2160px tbv image_style_create_derivative ────────────
@@ -835,10 +835,18 @@ function _ozk_profielfoto_is_mobiel() {
  * Kernlogica van de autocrop: werkt op een absoluut bestandspad.
  * Wordt aangeroepen vanuit zowel entityform- als webform-uploads.
  *
- * @param string        $pad      Absoluut pad naar het bronbestand (wordt IN PLACE overschreven).
- * @param object|null   $bestand  Drupal file-object (voor file_save na overschrijven); NULL = geen DB-update.
+ * @param string        $pad         Absoluut pad naar het bronbestand (wordt IN PLACE overschreven).
+ * @param object|null   $bestand     Drupal file-object (voor file_save na overschrijven); NULL = geen DB-update.
+ * @param int|null      $contact_id  CiviCRM contact-id; indien gezet wordt vóór het croppen een
+ *                                   ONGECROPTE (wel EXIF-genormaliseerde + ≤3840px) kopie bewaard,
+ *                                   zodat het proces later herhaald kan worden. Zonder dit ging een
+ *                                   ongelukkige crop bij de webform/entityform-route (public://
+ *                                   profielfotos/, geen backup-mechanisme, anders dan de CRM-route
+ *                                   die wél private/civicrm/custom-backups heeft) permanent verloren
+ *                                   — casus Vera/Joshua: geen manier meer om de fix tegen hun échte
+ *                                   origineel te testen.
  */
-function _ozk_profielfoto_autocrop_op_pad($pad, $bestand = NULL) {
+function _ozk_profielfoto_autocrop_op_pad($pad, $bestand = NULL, $contact_id = NULL) {
     $extdebug = 'ozk_profielfoto';
     $t_start  = microtime(TRUE);
     $_t       = function($label, $t0) use ($extdebug, $t_start) {
@@ -888,6 +896,24 @@ function _ozk_profielfoto_autocrop_op_pad($pad, $bestand = NULL) {
         }
     }
     $t_stap = $_t('0a. werkbestand cappen (≤' . $WERK_MAX . 'px)', $t_stap);
+
+    // ------------------------------------------------------------------ 0b. Ongecropte kopie bewaren
+    // Bewaar het bestand IN DEZE STAAT (EXIF-genormaliseerd, ≤3840px, nog NIET gecropt)
+    // vóór de gezichtscrop hieronder. Zonder dit is elke crop-beslissing definitief zodra
+    // hij eenmaal in-place is overschreven — geen manier meer om een latere fix in de
+    // detectie/crop-logica alsnog op de échte foto toe te passen.
+    if ($contact_id) {
+        $dir = 'private://profielfoto-ongecropt';
+        if (file_prepare_directory($dir, FILE_CREATE_DIRECTORY)) {
+            // Oude backup(s) met een ander extensie eerst weg (bv. vorige upload was .png,
+            // deze is .jpg) — anders blijft er een verweesd, verouderd bestand staan.
+            foreach (glob(drupal_realpath($dir) . '/' . (int) $contact_id . '.*') ?: [] as $_oud) {
+                @unlink($_oud);
+            }
+            $ext = strtolower(pathinfo($pad, PATHINFO_EXTENSION)) ?: 'jpg';
+            @copy($pad, drupal_realpath($dir . '/' . (int) $contact_id . '.' . $ext));
+        }
+    }
 
     // ------------------------------------------------------------------ 1. Gezicht detecteren
     // Detectie op origineel of max 4320px (2×2160) zodat kleine gezichten goed gevonden
@@ -1126,6 +1152,26 @@ function _ozk_profielfoto_autocrop_midden($pad) {
     if ($rv !== 0) {
         watchdog('ozk_profielfoto', 'autocrop_midden: ImageMagick mislukt (rv=@rv)', ['@rv' => $rv], WATCHDOG_ERROR);
     }
+}
+
+/**
+ * =======================================================================================
+ * HELPER: _ozk_profielfoto_lees_ongecropt
+ * =======================================================================================
+ * Geeft het absolute pad naar de bewaarde ONGECROPTE versie van een contact terug
+ * (zoals opgeslagen in sectie 0b van _ozk_profielfoto_autocrop_op_pad), of NULL als
+ * die niet bestaat. Gebruik dit om het detectie/crop-proces te herhalen op de échte
+ * bron nadat de detectie/crop-logica is verbeterd — zonder dit was een eerdere crop
+ * definitief (casus Vera/Joshua: geen manier meer om de hoofd-behoud-fix op hun
+ * werkelijke origineel te testen).
+ */
+function _ozk_profielfoto_lees_ongecropt($contact_id) {
+    $dir = drupal_realpath('private://profielfoto-ongecropt');
+    if (!$dir) {
+        return NULL;
+    }
+    $treffers = glob($dir . '/' . (int) $contact_id . '.*');
+    return ($treffers && is_file($treffers[0])) ? $treffers[0] : NULL;
 }
 
 /**
