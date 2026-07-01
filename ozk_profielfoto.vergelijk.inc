@@ -319,19 +319,47 @@ function _ozk_profielfoto_vergelijk_varianten($origineel_pad, $opts = array()) {
             }
         }
 
-        // Twee foto's naast elkaar: origineel links, productie-crop rechts.
+        // Server-links onder de twee foto's:
+        //  - origineel  -> de bewaarde ONGECROPTE backup (private://profielfoto-ongecropt,
+        //    ≤3840px). Wordt in dezelfde verwerkingsronde (autocrop sectie 0b) aangelegd,
+        //    dus bestaat tegen de tijd dat webteam de link aanklikt. Private file → alleen
+        //    voor ingelogd/gemachtigd webteam zichtbaar.
+        //  - gecropt    -> de contact-master (image_URL); die bevat na de crop de nieuwe
+        //    gezicht-crop (in-place overschreven onder dezelfde naam).
+        $orig_server_url = '';
+        $crop_server_url = '';
+        if ($contact_id) {
+            $ext_bron = strtolower(pathinfo($origineel_pad, PATHINFO_EXTENSION)) ?: 'jpg';
+            $orig_server_url = file_create_url('private://profielfoto-ongecropt/' . (int) $contact_id . '.' . $ext_bron);
+            $crop_server_url = (string) CRM_Core_DAO::singleValueQuery(
+                'SELECT image_URL FROM civicrm_contact WHERE id=%1', [1 => [(int) $contact_id, 'Integer']]
+            );
+        }
+        $srvlink = function ($url, $tekst) {
+            return $url
+                ? '<div style="font-size:11px;margin-top:3px"><a href="' . htmlspecialchars($url) . '" target="_blank" style="color:#c13c62">' . $tekst . '</a></div>'
+                : '';
+        };
+
+        // Twee foto's naast elkaar: origineel links, productie-crop rechts (beide klikbaar).
         $fotos_html = '<table cellpadding="0" cellspacing="0" style="margin-top:16px"><tr>'
             . '<td valign="top" style="padding-right:24px">'
             . ($orig_url
-                ? '<img src="' . $orig_url . '" style="display:block;max-width:320px;border:1px solid #ddd">'
+                ? ($orig_server_url ? '<a href="' . htmlspecialchars($orig_server_url) . '" target="_blank">' : '')
+                  . '<img src="' . $orig_url . '" style="display:block;max-width:320px;border:1px solid #ddd">'
+                  . ($orig_server_url ? '</a>' : '')
                   . '<div style="font-size:12px;color:#888;margin-top:4px">origineel ' . $W . '×' . $H . '</div>'
                   . $orig_datum_html
+                  . $srvlink($orig_server_url, 'origineel op server (ongecropt, ≤3840)')
                 : '<i>(origineel niet beschikbaar)</i>')
             . '</td>'
             . '<td valign="top">'
             . ($prod_url
-                ? '<img src="' . $prod_url . '" style="display:block;max-width:320px;border:1px solid #ddd">'
+                ? ($crop_server_url ? '<a href="' . htmlspecialchars($crop_server_url) . '" target="_blank">' : '')
+                  . '<img src="' . $prod_url . '" style="display:block;max-width:320px;border:1px solid #ddd">'
+                  . ($crop_server_url ? '</a>' : '')
                   . '<div style="font-size:12px;color:#888;margin-top:4px">' . htmlspecialchars($prod_label) . '</div>'
+                  . $srvlink($crop_server_url, 'gecropte master op server')
                 : '<i>' . htmlspecialchars($prod_label) . '</i>')
             . '</td>'
             . '</tr></table>';
