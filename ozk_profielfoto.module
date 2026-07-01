@@ -51,6 +51,28 @@ function ozk_profielfoto_entity_update($entity, $type) {
 }
 
 /**
+ * Implements hook_file_download().
+ *
+ * Geeft gemachtigd beheer (webteam/admin) toegang tot de bewaarde ONGECROPTE
+ * profielfoto-originelen in private://profielfoto-ongecropt/. Zonder deze hook geeft
+ * Drupal 7 een 404 op /system/files/profielfoto-ongecropt/... — private files zijn
+ * standaard dicht totdat een module expliciet toegang verleent. Deze bestanden zijn
+ * persoonsfoto's (vaak kinderen) → bewust NIET publiek, alleen voor beheerders.
+ */
+function ozk_profielfoto_file_download($uri) {
+    if (strpos((string) $uri, 'profielfoto-ongecropt/') === FALSE) {
+        return NULL; // niet onze map — laat andere modules beslissen
+    }
+    if (user_access('administer users')
+        || user_access('access all custom data')
+        || user_access('administer CiviCRM')) {
+        $info = @image_get_info($uri);
+        return ['Content-Type' => ($info['mime_type'] ?? 'image/jpeg')];
+    }
+    return -1; // toegang geweigerd (geen publieke toegang tot originelen)
+}
+
+/**
  * Lost het CiviCRM contact_id op uit een Drupal UID, ín de hoofdrequest waar
  * CiviCRM gegarandeerd actief is. Geeft NULL terug als het niet lukt; de shutdown
  * valt dan terug op een eigen lookup.
