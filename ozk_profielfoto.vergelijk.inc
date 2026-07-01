@@ -92,7 +92,27 @@ function _ozk_profielfoto_vergelijk_varianten($origineel_pad, $opts = array()) {
             $cy       = (int) round(($best_box['top']  + $best_box['bottom']) / 2);
             $crop_top = max(0, min($cy - (int) round($zijde * 0.42), $H - $zijde));
             $crop_lft = max(0, min($cx - (int) round($zijde / 2),    $W - $zijde));
-            $geom     = ['zijde' => $zijde, 'left' => $crop_lft, 'top' => $crop_top];
+
+            // Hoofd-behoud — zelfde stap als _ozk_profielfoto_autocrop_op_pad sectie 3b,
+            // anders toont deze preview een crop die productie niet meer maakt (was de
+            // oorzaak van de Vera/Joshua-casus: hier stond nog de OUDE, kruin-afsnijdende
+            // crop terwijl productie na de fix al ruimte boven het hoofd zou laten).
+            $gz_l = $best_box['left']; $gz_t = $best_box['top'];
+            $hoofd_top    = max(0, $gz_t - (int) round($bh * 0.6));
+            $hoofd_bottom = min($H, $best_box['bottom'] + (int) round($bh * 0.15));
+            $hoofd_left   = max(0, $gz_l - (int) round($bw * 0.2));
+            $hoofd_right  = min($W, $best_box['right'] + (int) round($bw * 0.2));
+            $hoofd_h = $hoofd_bottom - $hoofd_top; $hoofd_w = $hoofd_right - $hoofd_left;
+            $hoofd_cx = (int) round(($hoofd_left + $hoofd_right) / 2);
+            $hoofd_cy = (int) round(($hoofd_top  + $hoofd_bottom) / 2);
+            $crop_bevat_hoofd = ($crop_top <= $hoofd_top && ($crop_top + $zijde) >= $hoofd_bottom
+                                && $crop_lft <= $hoofd_left && ($crop_lft + $zijde) >= $hoofd_right);
+            if (!$crop_bevat_hoofd) {
+                $zijde    = min(max($zijde, $hoofd_h, $hoofd_w), $W, $H);
+                $crop_lft = max(0, min($hoofd_cx - (int) round($zijde / 2), $W - $zijde));
+                $crop_top = max(0, min($hoofd_cy - (int) round($zijde / 2), $H - $zijde));
+            }
+            $geom = ['zijde' => $zijde, 'left' => $crop_lft, 'top' => $crop_top];
 
             $prod_pad    = _ozk_vgl_crop($werkmap, $bron, $geom, 'prod');
             $_prod_pubdir = 'public://profielfoto-vergelijk';

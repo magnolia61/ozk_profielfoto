@@ -1050,21 +1050,27 @@ function _ozk_profielfoto_autocrop_op_pad($pad, $bestand = NULL) {
     // Past die hoofd-box in het origineel maar niet in de huidige crop, dan vergroten
     // we het vierkant (tot het maximale = korte zijde) en centreren we op het hoofd,
     // zodat het hele hoofd behouden blijft i.p.v. een strakkere, afsnijdende crop.
-    $hoofd_top    = $gz_top    - (int) round($gz_hoogte * 0.6);
-    $hoofd_bottom = $gz_bottom + (int) round($gz_hoogte * 0.15);
-    $hoofd_left   = $gz_left   - (int) round($gz_breed  * 0.2);
-    $hoofd_right  = $gz_right  + (int) round($gz_breed  * 0.2);
+    // Klem de geschatte hoofd-box direct op de werkelijke beeldgrenzen. Zonder deze
+    // clamp faalde de fix stelselmatig zodra de marge (bv. 0.6× boven een groot
+    // gezicht) net buiten het origineel viel — ook als er in werkelijkheid gewoon
+    // wat minder ruimte was dan de marge veronderstelde (casus Vera: geschatte kruin
+    // op -45px, dus "past niet volledig" → fix sloeg onterecht NIET aan, terwijl het
+    // origineel gewoon tot y=0 ruimte had die de standaard-crop links liet liggen).
+    $hoofd_top    = max(0, $gz_top    - (int) round($gz_hoogte * 0.6));
+    $hoofd_bottom = min($img_hoogte, $gz_bottom + (int) round($gz_hoogte * 0.15));
+    $hoofd_left   = max(0, $gz_left   - (int) round($gz_breed  * 0.2));
+    $hoofd_right  = min($img_breed, $gz_right + (int) round($gz_breed  * 0.2));
     $hoofd_h      = $hoofd_bottom - $hoofd_top;
     $hoofd_w      = $hoofd_right  - $hoofd_left;
     $hoofd_cx     = (int) round(($hoofd_left + $hoofd_right)  / 2);
     $hoofd_cy     = (int) round(($hoofd_top  + $hoofd_bottom) / 2);
 
-    $orig_bevat_hoofd  = ($hoofd_top >= 0 && $hoofd_bottom <= $img_hoogte
-                          && $hoofd_left >= 0 && $hoofd_right <= $img_breed);
+    // De geclampte hoofd-box past per definitie altijd in het origineel; we hoeven
+    // dus alleen te checken of de STANDAARD crop 'm volledig omvat.
     $crop_bevat_hoofd  = ($crop_top <= $hoofd_top && ($crop_top + $zijde) >= $hoofd_bottom
                           && $crop_left <= $hoofd_left && ($crop_left + $zijde) >= $hoofd_right);
 
-    if ($orig_bevat_hoofd && !$crop_bevat_hoofd) {
+    if (!$crop_bevat_hoofd) {
         // Maximaal vierkant dat het hoofd kan bevatten, begrensd door de korte zijde.
         $zijde     = min(max($zijde, $hoofd_h, $hoofd_w), $img_breed, $img_hoogte);
         $crop_left = $hoofd_cx - (int) round($zijde / 2);
