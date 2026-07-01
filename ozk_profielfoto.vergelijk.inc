@@ -71,9 +71,28 @@ function _ozk_profielfoto_vergelijk_varianten($origineel_pad, $opts = array()) {
         $orig_exif  = trim((string) @shell_exec(
             'magick identify -format %[EXIF:DateTimeOriginal] ' . escapeshellarg($origineel_pad . '[0]') . ' 2>/dev/null'
         ));
+        // Derde bron: veel bestandsnamen bevatten zelf al een datum/tijd —
+        // entityform (filefield_paths): naam_UID_YYYYMMDD_HHMM.ext
+        // webform/crm:                  IMG-YYYYMMDDHHMMSS-naam-crm.ext
+        // camera-native:                IMG_YYYYMMDD_HHMMSS_hash.ext
+        // Vaak de enige aanwijzing bij een teruggevonden/oud bestand waarvan de
+        // bestandsdatum (mtime) intussen door een latere aanraking is bijgewerkt.
+        $bn = basename($origineel_pad);
+        $orig_naamdatum = NULL;
+        if (preg_match('/_(\d{8})_(\d{4,6})(?=[_.]|$)/', $bn, $nm)) {
+            $orig_naamdatum = $nm[1] . '_' . $nm[2];
+        } elseif (preg_match('/[-_](\d{14})[-_]/', $bn, $nm)) {
+            $orig_naamdatum = substr($nm[1], 0, 8) . '_' . substr($nm[1], 8);
+        }
+        $orig_naamdatum_fmt = NULL;
+        if ($orig_naamdatum && preg_match('/^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})?$/', $orig_naamdatum, $dm)) {
+            $orig_naamdatum_fmt = "{$dm[3]}-{$dm[2]}-{$dm[1]} {$dm[4]}:{$dm[5]}" . (!empty($dm[6]) ? ":{$dm[6]}" : '');
+        }
+
         $orig_datum_html = '<div style="font-size:12px;color:#888;margin-top:2px">'
             . 'bestandsdatum: ' . ($orig_mtime ? date('d-m-Y H:i:s', $orig_mtime) : 'onbekend')
             . ($orig_exif ? ' &middot; EXIF-opnamedatum: ' . htmlspecialchars(str_replace(':', '-', substr($orig_exif, 0, 10)) . substr($orig_exif, 10)) : '')
+            . ($orig_naamdatum_fmt ? ' &middot; datum uit bestandsnaam: ' . htmlspecialchars($orig_naamdatum_fmt) : '')
             . '</div>';
 
         exec('magick ' . escapeshellarg($bron . '[0]') . ' -auto-orient +repage -quality 95 ' . escapeshellarg($bron));
