@@ -221,17 +221,69 @@ function _ozk_profielfoto_vergelijk_varianten($origineel_pad, $opts = array()) {
                . $rijen . '</table>';
 
         // Upload-links onderaan, mét geldige CiviCRM-checksum voor déze contact.
+        // Vierde link = eenmalige inloglink (OTL): logt écht in Drupal in (i.p.v. enkel
+        // een CiviCRM-checksum) en landt op het webform met cid1-prefill.
         $links_html = '';
+        $otl_fotolink = '';
         if ($contact_id && civicrm_initialize()) {
             $cs     = CRM_Contact_BAO_Contact_Utils::generateChecksum($contact_id);
             $q      = '?cid=' . $contact_id . '&cs=' . $cs;
             $civi_q = '?reset=1&gid=143&id=' . $contact_id . '&cs=' . $cs;
+
+            if (function_exists('ozk_onetimelogin')) {
+                $_uid_otl = CRM_Core_BAO_UFMatch::getUFId($contact_id);
+                if ($_uid_otl) {
+                    $_acct_otl = user_load($_uid_otl);
+                    if ($_acct_otl) {
+                        $otl_fotolink = ozk_onetimelogin($_acct_otl, '+7 day', 'form/profielfoto?cid1=' . $contact_id) ?: '';
+                    }
+                }
+            }
+
             $links_html =
                 '<p style="margin-top:16px"><b>Upload nieuwe foto via:</b></p><ol>'
               . '<li><a href="https://www.onvergetelijk.nl/profielfoto/edit' . $q . '">https://www.onvergetelijk.nl/profielfoto/edit</a> — entityform</li>'
               . '<li><a href="https://www.onvergetelijk.nl/civicrm/profile/edit' . $civi_q . '">CiviCRM profiel 143</a> — civicrm/profile/edit</li>'
               . '<li><a href="https://www.onvergetelijk.nl/form/profielfoto' . $q . '">https://www.onvergetelijk.nl/form/profielfoto</a> — webform upload</li>'
+              . ($otl_fotolink
+                    ? '<li><a href="' . $otl_fotolink . '">webform via eenmalige inloglink</a> — OTL (logt in Drupal + opent webform met prefill)</li>'
+                    : '<li>webform via eenmalige inloglink — (geen Drupal-account voor dit contact)</li>')
               . '</ol>';
+        }
+
+        // Token-gebaseerde afbeeldingen (zelfde 3 varianten als testmail 669): grid met
+        // raw image_URL, polaroid_plain (square_0260) en polaroid_naam (square_0260_naam).
+        // Zelfde regex-chain als de Smarty-tokens in template 669 (user_image_basename):
+        // strip een evt. ?photo=-parameter (imagefile-route) en het pad, houd bestandsnaam.
+        $token_grid_html = '';
+        if ($contact_id && civicrm_initialize()) {
+            $image_url_raw = CRM_Core_DAO::singleValueQuery(
+                'SELECT image_URL FROM civicrm_contact WHERE id = %1', [1 => [$contact_id, 'Integer']]
+            );
+            if ($image_url_raw) {
+                $basename = preg_replace(
+                    ['#^.*[?&]photo=#', '#[?&].*$#', '#^.*/#'],
+                    ['', '', ''],
+                    $image_url_raw
+                );
+                $styles_base    = 'https://www.onvergetelijk.nl/sites/default/files/styles';
+                $polaroid_plain = $styles_base . '/square_0260/public/profielfotos/' . $basename;
+                $polaroid_naam  = $styles_base . '/square_0260_naam/public/profielfotos/' . $basename;
+
+                $cel = function ($label, $url) {
+                    return '<td style="padding:8px;text-align:center;width:33%;vertical-align:top">'
+                         . '<div style="font-size:12px;font-weight:bold">' . htmlspecialchars($label) . '</div>'
+                         . '<img src="' . htmlspecialchars($url) . '" width="140" style="border-radius:4px;border:1px solid #ccc">'
+                         . '<div style="font-size:10px;color:#999;word-break:break-all;margin-top:4px">' . htmlspecialchars($url) . '</div>'
+                         . '</td>';
+                };
+                $token_grid_html = '<p style="margin-top:20px"><b>Token-gebaseerde afbeeldingen (zoals in mail 608):</b></p>'
+                    . '<table cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%"><tr>'
+                    . $cel('1. image_URL (raw)', $image_url_raw)
+                    . $cel('2. polaroid_plain', $polaroid_plain)
+                    . $cel('3. polaroid_naam', $polaroid_naam)
+                    . '</tr></table>';
+            }
         }
 
         // Twee foto's naast elkaar: origineel links, productie-crop rechts.
@@ -258,6 +310,7 @@ function _ozk_profielfoto_vergelijk_varianten($origineel_pad, $opts = array()) {
               . $tabel
               . $fotos_html
               . $montage_html
+              . $token_grid_html
               . $links_html
               . '<p style="color:#888;font-size:12px">Tijdelijke vergelijkmodus. Uitzetten: <code>drush vdel ozk_profielfoto_vergelijk</code></p>';
 
