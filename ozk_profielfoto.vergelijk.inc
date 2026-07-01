@@ -62,6 +62,20 @@ function _ozk_profielfoto_vergelijk_varianten($origineel_pad, $opts = array()) {
             watchdog('ozk_profielfoto', 'vergelijk: kon origineel niet kopiëren: @p', ['@p' => $origineel_pad], WATCHDOG_WARNING);
             return;
         }
+        // Datum/tijd van het ORIGINEEL (vóór evt. orient/resize) — bestand-mtime is
+        // altijd beschikbaar; EXIF DateTimeOriginal (indien aanwezig) is de echte
+        // opnamedatum, waardevol om te zien of dit een verse upload of een oud/
+        // teruggevonden origineel is (casus Vera/Joshua: 2023/2017-achtergrond-EXIF
+        // op een bestand met een recente bestandsdatum).
+        $orig_mtime = @filemtime($origineel_pad);
+        $orig_exif  = trim((string) @shell_exec(
+            'magick identify -format %[EXIF:DateTimeOriginal] ' . escapeshellarg($origineel_pad . '[0]') . ' 2>/dev/null'
+        ));
+        $orig_datum_html = '<div style="font-size:12px;color:#888;margin-top:2px">'
+            . 'bestandsdatum: ' . ($orig_mtime ? date('d-m-Y H:i:s', $orig_mtime) : 'onbekend')
+            . ($orig_exif ? ' &middot; EXIF-opnamedatum: ' . htmlspecialchars(str_replace(':', '-', substr($orig_exif, 0, 10)) . substr($orig_exif, 10)) : '')
+            . '</div>';
+
         exec('magick ' . escapeshellarg($bron . '[0]') . ' -auto-orient +repage -quality 95 ' . escapeshellarg($bron));
 
         // 1. Per-detector boxes ophalen via de --all-modus van ozk-facedetect.
@@ -292,6 +306,7 @@ function _ozk_profielfoto_vergelijk_varianten($origineel_pad, $opts = array()) {
             . ($orig_url
                 ? '<img src="' . $orig_url . '" style="display:block;max-width:320px;border:1px solid #ddd">'
                   . '<div style="font-size:12px;color:#888;margin-top:4px">origineel ' . $W . '×' . $H . '</div>'
+                  . $orig_datum_html
                 : '<i>(origineel niet beschikbaar)</i>')
             . '</td>'
             . '<td valign="top">'

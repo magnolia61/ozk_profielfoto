@@ -493,18 +493,25 @@ function _ozk_profielfoto_verwerk_na_move($dst_uri, $contact_id, $upload_bron) {
         'otl_fotolink'  => $otl_fotolink,
         'upload_bron'   => $upload_bron,
     ];
-    try {
-        \CRM_Core_BAO_MessageTemplate::sendTemplate([
-            'messageTemplateID' => 669,
-            'contactId'         => $contact_id,
-            'toEmail'           => 'webteam@onvergetelijk.nl',
-            'toName'            => 'Webteam OZK',
-            'from'              => 'Onvergetelijke Zomerkampen <info@onvergetelijk.nl>',
-            'tplParams'         => $tpl_params,
-        ]);
-        wachthond($extdebug, 3, 'mail 669 webteam verzonden', $contact_id);
-    } catch (\Throwable $_sendEx) {
-        wachthond($extdebug, 1, 'sendTemplate 669 webteam mislukt', $_sendEx->getMessage());
+    // 669 gaat NIET meer los uit als de vergelijkmodus aanstaat: die mail bevat
+    // onderaan al dezelfde token-grid + upload-links (zie ozk_profielfoto.vergelijk.inc).
+    // Anders kreeg webteam bij elke upload TWEE losse mails met overlappende inhoud.
+    if (!(function_exists('variable_get') && variable_get('ozk_profielfoto_vergelijk', FALSE))) {
+        try {
+            \CRM_Core_BAO_MessageTemplate::sendTemplate([
+                'messageTemplateID' => 669,
+                'contactId'         => $contact_id,
+                'toEmail'           => 'webteam@onvergetelijk.nl',
+                'toName'            => 'Webteam OZK',
+                'from'              => 'Onvergetelijke Zomerkampen <info@onvergetelijk.nl>',
+                'tplParams'         => $tpl_params,
+            ]);
+            wachthond($extdebug, 3, 'mail 669 webteam verzonden', $contact_id);
+        } catch (\Throwable $_sendEx) {
+            wachthond($extdebug, 1, 'sendTemplate 669 webteam mislukt', $_sendEx->getMessage());
+        }
+    } else {
+        wachthond($extdebug, 3, 'mail 669 overgeslagen: vergelijkmodus aan (info al in [VERGELIJK]-mail)', $contact_id);
     }
     $t_stap = $_tp('9. sendTemplate 669 (webteam)', $t_stap);
 
